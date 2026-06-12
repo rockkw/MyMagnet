@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.mach50.magnetlookup.plist
+  ─────────────────────────────
+  launchd agent that runs magnetlookup.py every day at 06:00.
+
+  INSTALL:
+    cp com.mach50.magnetlookup.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.mach50.magnetlookup.plist
+
+  CHECK STATUS:
+    launchctl list | grep mach50
+    cat /tmp/magnetlookup.err   # see any launch errors
+
+  UNINSTALL:
+    launchctl unload ~/Library/LaunchAgents/com.mach50.magnetlookup.plist
+
+  MANUAL TEST RUN:
+    launchctl start com.mach50.magnetlookup
+
+  NOTES:
+  - launchd is preferred over cron on macOS — it handles missed runs
+    when the Mac wakes from sleep.
+  - Full Disk Access must be granted to /usr/bin/python3 in
+    System Settings → Privacy & Security → Full Disk Access
+    (required for iCloud file access).
+  - Logs are written to ~/Documents/Development/logs/
+    with one file per day: magnetlookup_YYYY-MM-DD.log
+-->
+<plist version="1.0">
+<dict>
+
+  <!-- Job identity -->
+  <key>Label</key>
+  <string>com.mach50.magnetlookup</string>
+
+  <!-- Command and arguments -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/mach50/Documents/Development/magnetlookup.py</string>
+    <string>--cron</string>
+    <string>--no-browser</string>
+    <string>--log-dir</string>
+    <string>/Users/mach50/Documents/Development/logs</string>
+    <string>--db</string>
+    <string>/Users/mach50/Documents/Development/magnet_library.db</string>
+  </array>
+
+  <!-- Run daily at 06:00 -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>   <integer>6</integer>
+    <key>Minute</key> <integer>0</integer>
+  </dict>
+
+  <!-- If the Mac was asleep at 06:00, run as soon as it wakes -->
+  <key>RunAtLoad</key>
+  <false/>
+
+  <!-- Environment — ensure iCloud path resolves correctly -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/mach50</string>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <!-- Redirect stdout/stderr for debugging launch issues -->
+  <key>StandardOutPath</key>
+  <string>/tmp/magnetlookup.out</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/magnetlookup.err</string>
+
+  <!-- Restart on failure (up to 3 times) -->
+  <key>ThrottleInterval</key>
+  <integer>300</integer>
+
+</dict>
+</plist>

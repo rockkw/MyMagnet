@@ -1,0 +1,11 @@
+# magnetlookup — Python dependencies
+# Install with:
+#   pip3 install -r requirements.txt --break-system-packages
+
+requests==2.31.0
+beautifulsoup4==4.12.3
+lxml==5.2.1
+
+# Only needed for --js (headless Chrome) mode:
+selenium==4.21.0
+webdriver-manager==4.0.1
