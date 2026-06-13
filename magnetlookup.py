@@ -12,19 +12,24 @@ Replaces both urlhtml_ic.py and magnet_parser.py — no intermediate files neede
 
 COMMON USAGE (reads iCloud search_term.txt + urls.txt automatically):
 
-    python3 magnetlookup.py
-    python3 magnetlookup.py --js          # headless Chrome for JS-rendered sites
+    python3 magnetlookup.py               # headless Chrome on by default
+    python3 magnetlookup.py --no-js      # plain HTTP requests (faster, often blocked)
 
 ONE-OFF SEARCHES:
 
     python3 magnetlookup.py --term "Polymer Materials"
+    python3 magnetlookup.py --term "Polymer Materials" --category Books
     python3 magnetlookup.py --url "https://thepiratebay.org/search.php?q=Polymer+Materials"
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 INPUT FILES (defaults match urlhtml_ic.py):
 
-    search_term.txt   One search term per line
+    search_term.txt   One search term per line, with optional category headers:
+                      [Music]
+                      Pink Floyd
+                      [Books]
+                      Polymer Materials
                       ~/Library/Mobile Documents/com~apple~CloudDocs/Downloads/search_term.txt
 
     urls.txt          One URL template per line (with placeholder search param)
@@ -32,16 +37,17 @@ INPUT FILES (defaults match urlhtml_ic.py):
 
 OUTPUT:
 
-    magnet_results.html   Browser-ready results grouped by search term
-                          Sticky nav bar, Open Top 3 buttons, checkboxes, Open Checked
-    magnet_results.csv    Full log of all results including zero-seed
+    magnet_results_YYYY-MM-DD_HH-MM.html   Browser-ready results grouped by search term
+                                            Sticky nav bar, Open Top 3 buttons, checkboxes
+    magnet_results_YYYY-MM-DD_HH-MM.csv    Full log of all results including zero-seed
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 DEPENDENCIES:
 
     pip3 install requests beautifulsoup4 lxml --break-system-packages
-    pip3 install selenium webdriver-manager --break-system-packages   # only needed for --js
+    pip3 install selenium --break-system-packages   # required (JS mode is default)
+                                                    # selenium-manager handles chromedriver
 """
 
 import sys
@@ -53,8 +59,8 @@ import argparse
 import webbrowser
 import sqlite3
 import logging
-import configparser
-from collections import OrderedDict
+import configparser as _cp
+from collections import OrderedDict, defaultdict
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, unquote_plus
 from datetime import datetime
 from pathlib import Path
@@ -71,7 +77,6 @@ except ImportError:
 try:
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options as ChromeOptions
-    from selenium.webdriver.chrome.service import Service as ChromeService
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.common.by import By
@@ -80,70 +85,65 @@ except ImportError:
     SELENIUM_OK = False
 
 # ══════════════════════════════════════════════════════════════════════════
-# Configuration — loaded from config.ini next to this script, with fallbacks
+# Configuration — loaded from config.ini next to this script
 # ══════════════════════════════════════════════════════════════════════════
 
-def _load_config() -> configparser.ConfigParser:
-    cfg = configparser.ConfigParser()
-    cfg_path = Path(__file__).parent / 'config.ini'
-    if cfg_path.exists():
-        raw = cfg_path.read_text()
-        # Two-pass expansion: first resolve plain ${VAR} / $VAR references,
-        # then resolve ${VAR:-default} with the now-expanded default strings.
-        import re as _re
-        # Pass 1 — plain ${VAR} (no :- inside)
-        def _expand_plain(m):
-            var = m.group(1)
-            return os.environ.get(var, m.group(0))
-        raw = _re.sub(r'\$\{([^}:]+)\}', _expand_plain, raw)
-        raw = os.path.expandvars(raw)   # handle any remaining $VAR forms
-        # Pass 2 — ${VAR:-default} where default is now already expanded
-        def _expand_default(m):
-            var, _, default = m.group(1).partition(':-')
-            return os.environ.get(var.strip(), default.strip())
-        raw = _re.sub(r'\$\{([^}]+)\}', _expand_default, raw)
-        cfg.read_string(raw)
-    return cfg
+def _expand(value: str) -> str:
+    """
+    Expand ${VAR:-default} and $VAR patterns using os.environ.
+    Brace-aware so nested ${HOME} inside defaults works correctly.
+    """
+    result = []
+    i = 0
+    while i < len(value):
+        if value[i] == '$' and i + 1 < len(value) and value[i + 1] == '{':
+            depth, j = 0, i + 1
+            while j < len(value):
+                if value[j] == '{':
+                    depth += 1
+                elif value[j] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            var, _, default = value[i + 2:j].partition(':-')
+            resolved = os.environ.get(var)
+            result.append(resolved if resolved is not None else _expand(default))
+            i = j + 1
+        elif value[i] == '$' and i + 1 < len(value) and (value[i + 1].isalpha() or value[i + 1] == '_'):
+            m = re.match(r'[A-Za-z_][A-Za-z0-9_]*', value[i + 1:])
+            result.append(os.environ.get(m.group(), '') if m else '$')
+            i += 1 + (len(m.group()) if m else 0)
+        else:
+            result.append(value[i])
+            i += 1
+    return ''.join(result)
 
-_cfg = _load_config()
+_cfg = _cp.RawConfigParser()
+_cfg_path = Path(__file__).with_name('config.ini')
+if not _cfg.read(_cfg_path):
+    print(f'[WARN] config.ini not found at {_cfg_path} — using built-in defaults')
 
-def _path(section: str, key: str, fallback: str) -> str:
-    try:
-        return os.path.expanduser(_cfg.get(section, key))
-    except (configparser.NoSectionError, configparser.NoOptionError):
+def _get(section, key, fallback):
+    raw = _cfg.get(section, key, fallback=None)
+    if raw is None:
         return fallback
+    return _expand(raw)
 
-def _int(section: str, key: str, fallback: int) -> int:
-    try:
-        return _cfg.getint(section, key)
-    except (configparser.NoSectionError, configparser.NoOptionError, ValueError):
-        return fallback
+DEFAULT_SEARCH_FILE = _get('paths', 'search_file',
+    os.path.expanduser('~/Library/Mobile Documents/com~apple~CloudDocs/Downloads/search_term.txt'))
+DEFAULT_URLS_FILE   = _get('paths', 'urls_file',
+    os.path.expanduser('~/Documents/Development/urls.txt'))
+DEFAULT_DB_FILE     = _get('paths', 'db_file',
+    os.path.expanduser('~/Documents/Development/magnet_library.db'))
+DEFAULT_LOG_DIR     = _get('paths', 'log_dir',
+    os.path.expanduser('~/Documents/Development/logs'))
+DEFAULT_OUTPUT_DIR  = _get('paths', 'output_dir',
+    os.path.expanduser('~/Documents/Development/magnet_results'))
 
-DEFAULT_SEARCH_FILE = _path('paths', 'search_file',
-    str(Path.home() / 'Library/Mobile Documents'
-        '/com~apple~CloudDocs/Downloads/search_term.txt'))
-DEFAULT_URLS_FILE   = _path('paths', 'urls_file',
-    str(Path.home() / 'Documents/Development/urls.txt'))
-DEFAULT_DB_FILE     = _path('paths', 'db_file',
-    str(Path.home() / 'Documents/Development/magnet_library.db'))
-DEFAULT_LOG_DIR     = _path('paths', 'log_dir',
-    str(Path.home() / 'Documents/Development/logs'))
-DEFAULT_OUTPUT_DIR  = _path('paths', 'output_dir',
-    str(Path.home() / 'Documents/Development/magnet_results'))
-
-def _output(filename: str) -> str:
-    d = Path(DEFAULT_OUTPUT_DIR)
-    d.mkdir(parents=True, exist_ok=True)
-    stem, _, ext = filename.rpartition('.')
-    ts = datetime.now().strftime('%Y-%m-%d_%H-%M')
-    return str(d / f'{stem}_{ts}.{ext}')
-
-OUTPUT_HTML = _output('magnet_results.html')
-OUTPUT_CSV  = _output('magnet_results.csv')
-
-JS_RENDER_TIMEOUT   = _int('scraper', 'js_render_timeout', 10)
-JS_SETTLE_PAUSE     = _int('scraper', 'js_settle_pause', 2)
-REQUEST_DELAY       = _int('scraper', 'request_delay', 2)
+JS_RENDER_TIMEOUT   = int(_get('scraper', 'js_render_timeout', '10'))
+JS_SETTLE_PAUSE     = int(_get('scraper', 'js_settle_pause',   '2'))
+REQUEST_DELAY       = float(_get('scraper', 'request_delay',   '2'))
 
 # ══════════════════════════════════════════════════════════════════════════
 # Site scraping profiles
@@ -164,6 +164,7 @@ SITE_PROFILES = {
         'size_regex':        r'([\d.]+\s*[KMGT]iB)',
         'js_wait_selector':  'ol.view-single',
     },
+    # 1337x and 1377x share identical DOM; 1377x is a common mirror
     '1337x': {
         # Verified March 2026 — magnets on detail pages only
         'row_selector':      'table.table-list tbody tr',
@@ -177,7 +178,6 @@ SITE_PROFILES = {
         'js_wait_selector':  'table.table-list',
     },
     '1377x': {
-        # Mirror of 1337x — identical DOM
         'row_selector':      'table.table-list tbody tr',
         'title_selector':    'td.name a:nth-of-type(2)',
         'detail_page_magnet': True,
@@ -188,9 +188,9 @@ SITE_PROFILES = {
         'size_selector':     'td.size',
         'js_wait_selector':  'table.table-list',
     },
+    # rarbg and rargb share identical DOM; rargb.to is a common mirror spelling
     'rarbg': {
         # Verified March 2026 — magnets on detail pages only
-        # 'rarbg' matches rarbg.to; 'rargb' matches rargb.to (common mirror spelling)
         'row_selector':      'table.lista2t tr.lista2',
         'title_selector':    'td:nth-of-type(2) a',
         'detail_page_magnet': True,
@@ -202,7 +202,6 @@ SITE_PROFILES = {
         'js_wait_selector':  'table.lista2t',
     },
     'rargb': {
-        # Mirror spelling of rarbg — rargb.to — identical DOM
         'row_selector':      'table.lista2t tr.lista2',
         'title_selector':    'td:nth-of-type(2) a',
         'detail_page_magnet': True,
@@ -225,6 +224,44 @@ HEADERS = {
 }
 
 # ══════════════════════════════════════════════════════════════════════════
+# Shared helpers — used across scrape, deduplicate, output, and DB layers
+# ══════════════════════════════════════════════════════════════════════════
+
+def seed_int(r: dict) -> int:
+    try:
+        return int(str(r.get('seeds', '0')).strip())
+    except ValueError:
+        return 0
+
+def seeded(r: dict) -> bool:
+    s = str(r.get('seeds', '0')).strip()
+    try:
+        return int(s) > 0
+    except ValueError:
+        return s not in ('0', '?', '')
+
+def deduplicate(results: list[dict]) -> tuple[list[dict], int]:
+    """
+    Deduplicate a result list by info_hash, keeping the highest-seeded copy.
+    Annotates survivors with found_on (list of sites) and dup_count.
+    Returns (deduped_list, number_of_duplicates_removed).
+    """
+    shown = [r for r in results if seeded(r)]
+    hash_copies: dict[str, list[dict]] = defaultdict(list)
+    for r in shown:
+        ih = r.get('info_hash', '') or str(id(r))
+        hash_copies[ih].append(r)
+
+    deduped: list[dict] = []
+    for ih, copies in hash_copies.items():
+        best = dict(max(copies, key=seed_int))
+        best['found_on'] = sorted({urlparse(c['source_url']).netloc for c in copies})
+        best['dup_count'] = len(copies)
+        deduped.append(best)
+
+    return deduped, len(shown) - len(deduped)
+
+# ══════════════════════════════════════════════════════════════════════════
 # Dependency check
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -233,7 +270,7 @@ def check_dependencies(js_mode: bool = False):
     if not REQUESTS_OK:
         missing.append('pip3 install requests beautifulsoup4 lxml --break-system-packages')
     if js_mode and not SELENIUM_OK:
-        missing.append('pip3 install selenium webdriver-manager --break-system-packages')
+        missing.append('pip3 install selenium --break-system-packages')
     if missing:
         print('━' * 62)
         print('  Missing dependencies — install with:')
@@ -243,15 +280,11 @@ def check_dependencies(js_mode: bool = False):
         sys.exit(1)
 
 # ══════════════════════════════════════════════════════════════════════════
-# URL builder  (from urlhtml_ic.py)
+# URL builder
 # ══════════════════════════════════════════════════════════════════════════
 
 def inject_search_term(template_url: str, term: str) -> str:
-    """
-    Replace the search parameter in a URL template with the given term.
-    Handles ?q=, ?search=, and falls back to adding ?search= if neither exists.
-    Mirrors the logic in urlhtml_ic.py replace_search_parameter().
-    """
+    """Replace the search parameter in a URL template with the given term."""
     parsed = urlparse(template_url)
     params = parse_qs(parsed.query)
 
@@ -265,10 +298,7 @@ def inject_search_term(template_url: str, term: str) -> str:
     return urlunparse(parsed._replace(query=urlencode(params, doseq=True)))
 
 def build_search_urls(term: str, urls_file: str) -> list[str]:
-    """
-    Read URL templates from urls_file and inject the search term into each.
-    Returns a list of ready-to-fetch search URLs.
-    """
+    """Read URL templates from urls_file and inject the search term into each."""
     try:
         with open(urls_file, 'r') as f:
             templates = [l.strip() for l in f if l.strip()]
@@ -287,13 +317,7 @@ def build_search_urls(term: str, urls_file: str) -> list[str]:
 # ══════════════════════════════════════════════════════════════════════════
 
 def normalise_category(raw: str) -> str:
-    """
-    Normalise a category name to title-case.
-    '[music]', '[MUSIC]', '[Music]' all become 'Music'.
-    Strips surrounding whitespace and the bracket characters.
-    """
     return raw.strip().title()
-
 
 def read_search_terms(path: str) -> list[tuple[str, str]]:
     """
@@ -301,19 +325,14 @@ def read_search_terms(path: str) -> list[tuple[str, str]]:
 
     File format:
         [Music]             ← sets current category (title-cased on read)
-        Pink Floyd          ← term inherits current category → ('Pink Floyd', 'Music')
+        Pink Floyd          ← ('Pink Floyd', 'Music')
         Aphex Twin
         # commented out     ← ignored
         [Books]
         Polymer Materials   ← ('Polymer Materials', 'Books')
 
-    Rules:
-    - Lines starting with [ and ending with ] are category headers.
-    - Category names are title-cased: [music] → 'Music'.
-    - Lines before any header get category 'Default'.
-    - Blank lines and lines starting with # are ignored.
-    - Backward compatible: a file with no headers works unchanged,
-      all terms get category 'Default'.
+    Lines before any header get category 'Default'.
+    A file with no headers works unchanged — all terms get category 'Default'.
     """
     try:
         with open(path, 'r') as f:
@@ -339,8 +358,6 @@ def read_search_terms(path: str) -> list[tuple[str, str]]:
         print(f'[ERROR] No search terms found in {path}')
         sys.exit(1)
 
-    # Print summary grouped by category
-    from collections import defaultdict
     by_cat: dict[str, list[str]] = defaultdict(list)
     for term, cat in results:
         by_cat[cat].append(term)
@@ -356,35 +373,8 @@ def read_search_terms(path: str) -> list[tuple[str, str]]:
 # ══════════════════════════════════════════════════════════════════════════
 # Selenium headless driver
 # ══════════════════════════════════════════════════════════════════════════
-
-# Candidate chromedriver paths — checked in order, first found is used.
-# Homebrew on Apple Silicon installs to /opt/homebrew/bin/,
-# Homebrew on Intel Macs installs to /usr/local/bin/.
-CHROMEDRIVER_CANDIDATES = [
-    '/opt/homebrew/bin/chromedriver',   # Homebrew Apple Silicon (M1/M2/M3)
-    '/usr/local/bin/chromedriver',      # Homebrew Intel Mac
-    '/usr/bin/chromedriver',            # system fallback
-]
-
-def find_chromedriver() -> str:
-    """
-    Locate chromedriver on the system without using webdriver-manager.
-    Checks known Homebrew paths first, then falls back to PATH lookup.
-    Raises RuntimeError if not found.
-    """
-    import shutil
-    for path in CHROMEDRIVER_CANDIDATES:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
-    # Final fallback: search PATH
-    found = shutil.which('chromedriver')
-    if found:
-        return found
-    raise RuntimeError(
-        'chromedriver not found. Install with:\n'
-        '  brew install chromedriver\n'
-        '  xattr -d com.apple.quarantine $(which chromedriver)'
-    )
+# Uses selenium-manager (built into Selenium 4.6+) to automatically locate
+# or download a matching chromedriver. No manual driver install needed.
 
 def build_headless_driver() -> 'webdriver.Chrome':
     opts = ChromeOptions()
@@ -395,8 +385,8 @@ def build_headless_driver() -> 'webdriver.Chrome':
     opts.add_argument('--window-size=1920,1080')
     opts.add_argument(f'user-agent={HEADERS["User-Agent"]}')
     opts.add_experimental_option('excludeSwitches', ['enable-logging'])
-    service = ChromeService(find_chromedriver())
-    driver  = webdriver.Chrome(service=service, options=opts)
+    # No Service() argument — selenium-manager handles driver location/download
+    driver = webdriver.Chrome(options=opts)
     driver.set_page_load_timeout(30)
     return driver
 
@@ -404,8 +394,7 @@ def fetch_js(url: str, wait_selector: str | None = None,
              driver: 'webdriver.Chrome | None' = None) -> str | None:
     """
     Fetch a URL with headless Chrome and return fully-rendered HTML.
-    If driver is provided, reuses it (no launch/quit overhead).
-    If driver is None, creates a temporary one and quits it when done.
+    Reuses driver if provided; otherwise creates a temporary one and quits it.
     """
     owns_driver = driver is None
     try:
@@ -436,12 +425,31 @@ def fetch_js(url: str, wait_selector: str | None = None,
 # Static HTTP fetch
 # ══════════════════════════════════════════════════════════════════════════
 
-def fetch_static(url: str) -> str | None:
+def fetch_static(url: str, js_mode: bool = False) -> str | None:
     """Fetch a URL with requests and return HTML, or None on failure."""
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
-        return resp.text
+        html = resp.text
+        # Detect JS-wall responses and warn the user
+        if not js_mode:
+            cf_challenge = (
+                '<meta http-equiv="refresh"' in html and 'CF$cv$params' in html
+            )
+            js_required = 'Enable JS in your browser' in html
+            if cf_challenge or js_required:
+                reason = 'Cloudflare JS challenge' if cf_challenge else 'JS required'
+                print(f'  [WARN] {urlparse(url).netloc} returned a {reason} — '
+                      f'use --no-js to see plain-HTTP output anyway')
+                return None
+        return html
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 403 and not js_mode:
+            print(f'  [WARN] {urlparse(url).netloc} blocked the request (403) — '
+                  f'try without --no-js to use headless Chrome')
+        else:
+            print(f'  [WARN] Could not fetch {url}: {e}')
+        return None
     except requests.RequestException as e:
         print(f'  [WARN] Could not fetch {url}: {e}')
         return None
@@ -449,7 +457,7 @@ def fetch_static(url: str) -> str | None:
 def fetch_page(url: str, js_mode: bool,
                wait_selector: str | None = None) -> str | None:
     """Fetch a page either statically or via headless Chrome."""
-    return fetch_js(url, wait_selector) if js_mode else fetch_static(url)
+    return fetch_js(url, wait_selector) if js_mode else fetch_static(url, js_mode=False)
 
 # ══════════════════════════════════════════════════════════════════════════
 # Magnet utilities
@@ -484,7 +492,7 @@ def fetch_detail_magnet(detail_url: str, selector: str,
     if js_mode:
         html = fetch_js(detail_url, wait_selector=None, driver=driver)
     else:
-        html = fetch_static(detail_url)
+        html = fetch_static(detail_url, js_mode=False)
     if not html:
         return ''
     soup = BeautifulSoup(html, 'lxml')
@@ -501,10 +509,8 @@ def parse_results(html: str, source_url: str,
                   driver: 'webdriver.Chrome | None' = None) -> list[dict]:
     """
     Parse a search results page and return a list of result dicts.
-    Uses the site profile if one exists, otherwise falls back to a
-    raw regex scan for any magnet: URI present in the HTML.
-    driver: shared Selenium driver passed through for detail page fetches,
-            avoiding a new Chrome launch per row.
+    Uses the site profile if one exists; falls back to a raw regex magnet scan.
+    driver: shared Selenium driver for detail page fetches (avoids re-launching Chrome).
     """
     profile = get_profile(source_url)
     soup    = BeautifulSoup(html, 'lxml')
@@ -514,8 +520,7 @@ def parse_results(html: str, source_url: str,
         rows = soup.select(profile['row_selector'])
         for row in rows:
             title_tag = row.select_one(profile['title_selector'])
-            # Fallback: if nth-of-type CSS selector returns no text (BS4 quirk),
-            # walk tds directly and grab the first <a> with an href from td[1]
+            # Fallback: BS4 quirk with nth-of-type — walk tds directly
             if not title_tag or not title_tag.get_text(strip=True):
                 tds = row.find_all('td', recursive=False)
                 if len(tds) > 1:
@@ -524,13 +529,11 @@ def parse_results(html: str, source_url: str,
                 continue
             title = title_tag.get_text(strip=True)
 
-            # Seeds / leeches
             s_tag = row.select_one(profile['seed_selector'])
             l_tag = row.select_one(profile['leech_selector'])
             seeds   = s_tag.get_text(strip=True) if s_tag else '?'
             leeches = l_tag.get_text(strip=True) if l_tag else '?'
 
-            # Size
             size = '?'
             if profile.get('size_selector'):
                 sz = row.select_one(profile['size_selector'])
@@ -539,7 +542,6 @@ def parse_results(html: str, source_url: str,
                 m = re.search(profile['size_regex'], row.get_text(' '))
                 size = m.group(1) if m else '?'
 
-            # Magnet — inline on page or via detail page
             if profile.get('detail_page_magnet'):
                 href = title_tag.get('href', '')
                 if not href:
@@ -548,8 +550,7 @@ def parse_results(html: str, source_url: str,
                 detail_url = base + href if href.startswith('/') else href
                 print(f'    [detail] {title[:55]}')
                 magnet = fetch_detail_magnet(
-                    detail_url, profile['magnet_selector'], js_mode,
-                    driver=driver   # reuse the shared Chrome instance
+                    detail_url, profile['magnet_selector'], js_mode, driver=driver
                 )
                 time.sleep(1)
             else:
@@ -572,7 +573,6 @@ def parse_results(html: str, source_url: str,
             })
 
     else:
-        # Generic fallback
         print(f'  [INFO] No profile for {urlparse(source_url).netloc}'
               f' — generic magnet scan')
         seen = set()
@@ -619,27 +619,20 @@ def scrape(url: str, js_mode: bool = False) -> list[dict]:
         if shared_driver:
             shared_driver.quit()
 
-
 # ══════════════════════════════════════════════════════════════════════════
 # Logging setup
 # ══════════════════════════════════════════════════════════════════════════
 
 def setup_logging(log_dir: str | None = None) -> logging.Logger:
-    """
-    Configure logging to stdout and optionally a rotating daily log file.
-    Returns the root logger. Call once at startup.
-    """
     log = logging.getLogger('magnetlookup')
     log.setLevel(logging.INFO)
     fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s',
                              datefmt='%Y-%m-%d %H:%M:%S')
 
-    # Always log to stdout
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
     log.addHandler(sh)
 
-    # Optionally log to a dated file
     if log_dir:
         Path(log_dir).mkdir(parents=True, exist_ok=True)
         date_str  = datetime.now().strftime('%Y-%m-%d')
@@ -651,7 +644,6 @@ def setup_logging(log_dir: str | None = None) -> logging.Logger:
 
     return log
 
-# Module-level logger — replaced by setup_logging() at startup
 log = logging.getLogger('magnetlookup')
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -661,20 +653,20 @@ log = logging.getLogger('magnetlookup')
 DB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS searches (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_at      TEXT    NOT NULL,          -- ISO timestamp of this scrape run
-    terms       TEXT    NOT NULL,          -- comma-separated search terms
+    run_at      TEXT    NOT NULL,
+    terms       TEXT    NOT NULL,
     js_mode     INTEGER NOT NULL DEFAULT 0,
     total_found INTEGER NOT NULL DEFAULT 0,
     dupes_removed INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS torrents (
-    info_hash   TEXT PRIMARY KEY,          -- SHA1 from magnet xt= param
+    info_hash   TEXT PRIMARY KEY,
     title       TEXT NOT NULL,
     size        TEXT,
     best_seeds  INTEGER NOT NULL DEFAULT 0,
     best_leeches INTEGER NOT NULL DEFAULT 0,
-    first_seen  TEXT NOT NULL,             -- ISO timestamp
+    first_seen  TEXT NOT NULL,
     last_seen   TEXT NOT NULL,
     magnet      TEXT NOT NULL
 );
@@ -695,12 +687,12 @@ CREATE TABLE IF NOT EXISTS search_results (
 
 CREATE TABLE IF NOT EXISTS categories (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT UNIQUE NOT NULL    -- title-cased e.g. 'Music', 'Books'
+    name        TEXT UNIQUE NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS search_terms (
     term        TEXT PRIMARY KEY,
-    category    TEXT NOT NULL DEFAULT 'Default',  -- normalised title-case
+    category    TEXT NOT NULL DEFAULT 'Default',
     first_used  TEXT NOT NULL,
     last_used   TEXT NOT NULL,
     use_count   INTEGER NOT NULL DEFAULT 1
@@ -716,7 +708,6 @@ CREATE INDEX IF NOT EXISTS idx_terms_cat   ON search_terms(category);
 """
 
 def open_db(db_path: str) -> sqlite3.Connection:
-    """Open (or create) the SQLite database, apply schema, return connection."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -736,35 +727,8 @@ def write_db_term(conn: sqlite3.Connection,
     """
     now = datetime.now().isoformat(timespec='seconds')
 
-    def seed_int(r: dict) -> int:
-        try:
-            return int(str(r.get('seeds', '0')).strip())
-        except ValueError:
-            return 0
+    deduped, deduped_count = deduplicate(term_results)
 
-    def seeded(r: dict) -> bool:
-        s = str(r.get('seeds', '0')).strip()
-        try:
-            return int(s) > 0
-        except ValueError:
-            return s not in ('0', '?', '')
-
-    from collections import defaultdict
-    shown = [r for r in term_results if seeded(r)]
-    hash_copies: dict[str, list[dict]] = defaultdict(list)
-    for r in shown:
-        ih = r.get('info_hash', '') or str(id(r))
-        hash_copies[ih].append(r)
-
-    deduped: list[dict] = []
-    for ih, copies in hash_copies.items():
-        best = dict(max(copies, key=seed_int))
-        best['found_on'] = sorted({urlparse(c['source_url']).netloc for c in copies})
-        deduped.append(best)
-
-    deduped_count = len(shown) - len(deduped)
-
-    # ── Insert scrape run ─────────────────────────────────────────────────
     cur = conn.execute(
         "INSERT INTO searches (run_at, terms, js_mode, total_found, dupes_removed) "
         "VALUES (?, ?, ?, ?, ?)",
@@ -772,10 +736,8 @@ def write_db_term(conn: sqlite3.Connection,
     )
     search_id = cur.lastrowid
 
-    # ── Upsert category ───────────────────────────────────────────────────
     conn.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (category,))
 
-    # ── Upsert each unique torrent ────────────────────────────────────────
     for r in deduped:
         ih = r.get('info_hash', '')
         if not ih:
@@ -818,7 +780,6 @@ def write_db_term(conn: sqlite3.Connection,
             (search_id, ih, label, seeds)
         )
 
-    # ── Upsert search term ────────────────────────────────────────────────
     conn.execute(
         "INSERT INTO search_terms "
         "    (term, category, first_used, last_used, use_count) "
@@ -834,32 +795,24 @@ def write_db_term(conn: sqlite3.Connection,
     log.info(f'DB [{label}]: {len(deduped)} torrents committed (run id={search_id})')
     return search_id
 
-
 # ══════════════════════════════════════════════════════════════════════════
 # Output — CSV
 # ══════════════════════════════════════════════════════════════════════════
 
-def write_csv(all_results: list[dict]):
-    fields = ['search_term', 'title', 'size', 'seeds', 'leeches',
+def write_csv(all_results: list[dict], filename: str):
+    fields = ['search_term', 'category', 'title', 'size', 'seeds', 'leeches',
               'info_hash', 'magnet', 'source_url']
-    with open(OUTPUT_CSV, 'w', newline='') as f:
+    with open(filename, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
         w.writeheader()
         w.writerows(all_results)
-    print(f'[✓] CSV written  → {OUTPUT_CSV}')
+    print(f'[✓] CSV written  → {filename}')
 
 # ══════════════════════════════════════════════════════════════════════════
 # Output — terminal summary
 # ══════════════════════════════════════════════════════════════════════════
 
 def print_summary(all_results: list[dict]):
-    def seeded(r):
-        s = str(r.get('seeds', '0')).strip()
-        try:
-            return int(s) > 0
-        except ValueError:
-            return s not in ('0', '?', '')
-
     shown  = [r for r in all_results if seeded(r)]
     hidden = len(all_results) - len(shown)
 
@@ -867,14 +820,6 @@ def print_summary(all_results: list[dict]):
         print('\n  No seeded magnet links found.\n')
         return
 
-    # Deduplicate by info_hash — keep highest-seeded copy per hash
-    def seed_int(r: dict) -> int:
-        try:
-            return int(str(r.get('seeds', '0')).strip())
-        except ValueError:
-            return 0
-
-    from collections import defaultdict
     hash_copies: dict[str, list[dict]] = defaultdict(list)
     for r in shown:
         ih = r.get('info_hash', '') or str(id(r))
@@ -904,6 +849,7 @@ def print_summary(all_results: list[dict]):
 # ══════════════════════════════════════════════════════════════════════════
 
 def write_html(all_results: list[dict], search_label: str,
+               filename: str,
                term_urls: dict | None = None):
     """
     Write magnet_results.html — grouped by search term with:
@@ -916,17 +862,9 @@ def write_html(all_results: list[dict], search_label: str,
     """
     ts = datetime.now().strftime('%Y-%m-%d %H:%M')
 
-    def seeded(r: dict) -> bool:
-        s = str(r.get('seeds', '0')).strip()
-        try:
-            return int(s) > 0
-        except ValueError:
-            return s not in ('0', '?', '')
-
     shown    = [r for r in all_results if seeded(r)]
     filtered = len(all_results) - len(shown)
 
-    # Group by search term
     groups: dict[str, list[dict]] = OrderedDict()
     for r in shown:
         term = r.get('search_term', search_label)
@@ -935,7 +873,6 @@ def write_html(all_results: list[dict], search_label: str,
     def slugify(text: str) -> str:
         return re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')
 
-    # ── Nav items ─────────────────────────────────────────────────────────
     nav_items = ''
     for term, rows in groups.items():
         slug = slugify(term)
@@ -944,7 +881,6 @@ def write_html(all_results: list[dict], search_label: str,
             f'<span class="nav-count">({len(rows)})</span></a>\n'
         )
 
-    # ── Global Open All Top 3s button ─────────────────────────────────────
     all_top3 = []
     for rows in groups.values():
         all_top3.extend(r['magnet'] for r in rows[:3])
@@ -966,42 +902,13 @@ def write_html(all_results: list[dict], search_label: str,
     </button>
   </nav>"""
 
-    # ── Deduplicate by info_hash across all sites ────────────────────────
-    # When the same torrent appears on multiple sites, keep only the copy
-    # with the highest seed count. Collect the site names that were merged
-    # so they can be shown as a tooltip on the surviving row.
-    def seed_int(r: dict) -> int:
-        try:
-            return int(str(r.get('seeds', '0')).strip())
-        except ValueError:
-            return 0
+    deduped, deduped_count = deduplicate(all_results)
 
-    # Group all copies of each hash, track which sites carried it
-    from collections import defaultdict
-    hash_copies: dict[str, list[dict]] = defaultdict(list)
-    for r in shown:
-        ih = r.get('info_hash', '')
-        hash_copies[ih if ih else id(r)].append(r)
-
-    deduped: list[dict] = []
-    for ih, copies in hash_copies.items():
-        best = max(copies, key=seed_int)
-        # Annotate with all sites that had this torrent
-        all_sites = sorted({urlparse(c['source_url']).netloc for c in copies})
-        best = dict(best)   # shallow copy so we don't mutate shared state
-        best['found_on'] = all_sites
-        best['dup_count'] = len(copies)
-        deduped.append(best)
-
-    deduped_count = len(shown) - len(deduped)
-
-    # Rebuild groups from deduped list, preserving original term order
     groups = OrderedDict()
     for r in deduped:
         term = r.get('search_term', search_label)
         groups.setdefault(term, []).append(r)
 
-    # ── Sections ──────────────────────────────────────────────────────────
     sections_html = ''
     for term, rows in groups.items():
         slug = slugify(term)
@@ -1038,8 +945,9 @@ def write_html(all_results: list[dict], search_label: str,
                      data-magnet="{safe_magnet}"
                      onchange="updateSectionBtn(this)">
             </td>
-            <td><a href="{r['magnet']}" title="{r['magnet'][:80]}…">🧲</a></td>
-            <td>{r['title']}{multi_badge}</td>
+            <td><button class="mag-btn" title="Open in Transmission"
+                onclick="fireMagnet('{safe_magnet}')">🧲</button></td>
+            <td><a href="{r['magnet']}">{r['title']}{multi_badge}</a></td>
             <td>{r['size']}</td>
             <td class="seeds">{r['seeds']}</td>
             <td class="leeches">{r['leeches']}</td>
@@ -1047,7 +955,6 @@ def write_html(all_results: list[dict], search_label: str,
             <td><code class="hash">{r['info_hash'][:12]}…</code></td>
           </tr>"""
 
-        # Build search URL links for this term
         url_links_html = ''
         if term_urls and term in term_urls:
             link_items = ''
@@ -1124,7 +1031,6 @@ def write_html(all_results: list[dict], search_label: str,
     h1          {{ color: #f90; margin-bottom: 0.2rem; }}
     .meta       {{ font-size: 0.8rem; color: #888; margin-bottom: 1.5rem; }}
 
-
     /* ── Sections ── */
     section     {{ margin-bottom: 3rem; scroll-margin-top: 52px; }}
     h2          {{ color: #f90; border-bottom: 1px solid #333;
@@ -1168,6 +1074,12 @@ def write_html(all_results: list[dict], search_label: str,
       font-size: 0.8rem; font-weight: 600; padding: 0.3rem 0.75rem;
       transition: background 0.15s, transform 0.1s; white-space: nowrap;
     }}
+    .mag-btn {{
+      cursor: pointer; background: none; border: none;
+      font-size: 1rem; padding: 0;
+    }}
+    .mag-btn:hover {{ filter: brightness(1.4); }}
+
     .open-top3 {{
       background: #1a3a1a; color: #4c4; border: 1px solid #4c4;
     }}
@@ -1230,7 +1142,6 @@ def write_html(all_results: list[dict], search_label: str,
       document.body.removeChild(a);
     }}
 
-    // Fire magnets in sequence with 800 ms gaps. Returns a Promise.
     function fireSequence(magnets) {{
       return new Promise(resolve => {{
         magnets.forEach((m, idx) => {{
@@ -1242,7 +1153,6 @@ def write_html(all_results: list[dict], search_label: str,
       }});
     }}
 
-    // Disable a button, show progress, re-enable when done.
     function withFeedback(btn, origLabel, magnets) {{
       btn.disabled    = true;
       btn.textContent = `⏳ Opening ${{magnets.length}}…`;
@@ -1252,7 +1162,6 @@ def write_html(all_results: list[dict], search_label: str,
       }});
     }}
 
-    // ── Top-3 buttons ────────────────────────────────────────────────────
     function openTop3(btn) {{
       const magnets = [];
       let i = 1;
@@ -1273,7 +1182,6 @@ def write_html(all_results: list[dict], search_label: str,
       withFeedback(btn, btn.textContent.trim(), magnets);
     }}
 
-    // ── Checkbox logic ───────────────────────────────────────────────────
     function toggleAll(selectAllCb) {{
       const section = selectAllCb.closest('section');
       section.querySelectorAll('.row-cb').forEach(cb => {{
@@ -1302,7 +1210,6 @@ def write_html(all_results: list[dict], search_label: str,
       btn.textContent = `☑ Open Checked (${{checked.length}})`;
     }}
 
-    // ── Open Checked button ──────────────────────────────────────────────
     function openChecked(btn) {{
       const section = btn.closest('section');
       const checked = section.querySelectorAll('.row-cb:checked');
@@ -1327,9 +1234,9 @@ def write_html(all_results: list[dict], search_label: str,
 </body>
 </html>"""
 
-    with open(OUTPUT_HTML, 'w') as f:
+    with open(filename, 'w') as f:
         f.write(html)
-    print(f'\n[✓] HTML written → {OUTPUT_HTML}')
+    print(f'\n[✓] HTML written → {filename}')
 
 # ══════════════════════════════════════════════════════════════════════════
 # CLI
@@ -1343,7 +1250,6 @@ def parse_args():
         epilog=__doc__,
     )
 
-    # Input mode — all optional; default is --search-file
     group = p.add_mutually_exclusive_group()
     group.add_argument(
         '--term', metavar='TERM',
@@ -1366,8 +1272,8 @@ def parse_args():
         help=f'Path to urls.txt (default: {DEFAULT_URLS_FILE})'
     )
     p.add_argument(
-        '--js', action='store_true',
-        help='Use headless Chrome (Selenium) for JS-rendered sites like TPB'
+        '--no-js', action='store_true',
+        help='Disable headless Chrome and use plain HTTP requests instead'
     )
     p.add_argument(
         '--category', metavar='CATEGORY', default=None,
@@ -1409,22 +1315,21 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # ── Logging ───────────────────────────────────────────────────────────
     log_dir = args.log_dir or (DEFAULT_LOG_DIR if args.cron else None)
     global log
     log = setup_logging(log_dir)
 
-    # --cron implies --no-browser
     no_browser = args.no_browser or args.cron
+    js_mode    = not args.no_js
 
-    check_dependencies(js_mode=args.js)
+    check_dependencies(js_mode=js_mode)
 
-    if args.js:
+    if js_mode:
         log.info('JS mode — headless Chrome active')
     if args.cron:
         log.info('Cron mode active')
 
-    # ── Build scrape jobs: list of (label, category, [urls]) ───────────
+    # ── Build scrape jobs: list of (label, category, [urls]) ──────────────
     jobs: list[tuple[str, str, list[str]]] = []
 
     if args.url:
@@ -1439,7 +1344,7 @@ def main():
             urls = build_search_urls(term, args.urls_file)
             jobs.append((term, category, urls))
 
-    # ── Database connection (opened once, committed per term) ─────────────
+    # ── Database connection ────────────────────────────────────────────────
     conn = None
     if not args.no_db:
         try:
@@ -1458,7 +1363,7 @@ def main():
         term_results: list[dict] = []
         for i, url in enumerate(urls):
             try:
-                results = scrape(url, js_mode=args.js)
+                results = scrape(url, js_mode=js_mode)
                 for r in results:
                     r['search_term'] = label
                     r['category']    = category
@@ -1474,10 +1379,9 @@ def main():
 
         all_results.extend(term_results)
 
-        # Commit this term's results before moving to the next term
         if conn is not None:
             try:
-                write_db_term(conn, term_results, label, category, args.js)
+                write_db_term(conn, term_results, label, category, js_mode)
             except Exception as e:
                 log.error(f'DB write failed for [{label}]: {e}')
                 had_error = True
@@ -1485,48 +1389,23 @@ def main():
     if conn is not None:
         conn.close()
 
-    # ── Deduplicate (mirrors write_html logic — shared helper) ────────────
-    def seed_int(r: dict) -> int:
-        try:
-            return int(str(r.get('seeds', '0')).strip())
-        except ValueError:
-            return 0
-
-    def seeded(r: dict) -> bool:
-        s = str(r.get('seeds', '0')).strip()
-        try:
-            return int(s) > 0
-        except ValueError:
-            return s not in ('0', '?', '')
-
-    from collections import defaultdict
-    shown = [r for r in all_results if seeded(r)]
-    hash_copies: dict[str, list[dict]] = defaultdict(list)
-    for r in shown:
-        ih = r.get('info_hash', '') or str(id(r))
-        hash_copies[ih].append(r)
-
-    deduped: list[dict] = []
-    for ih, copies in hash_copies.items():
-        best = dict(max(copies, key=seed_int))
-        best['found_on'] = sorted({urlparse(c['source_url']).netloc for c in copies})
-        best['dup_count'] = len(copies)
-        deduped.append(best)
-
-    deduped_count = len(shown) - len(deduped)
-
     # ── Output ────────────────────────────────────────────────────────────
+    out_dir = Path(DEFAULT_OUTPUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts      = datetime.now().strftime('%Y-%m-%d_%H-%M')
+    ts_html = str(out_dir / f'magnet_results_{ts}.html')
+    ts_csv  = str(out_dir / f'magnet_results_{ts}.csv')
+
     page_label = jobs[0][0] if len(jobs) == 1 else f'{len(jobs)} terms'
     term_urls  = {label: urls for label, _, urls in jobs}
 
     print_summary(all_results)
-    write_html(all_results, page_label, term_urls=term_urls)
-    write_csv(all_results)
+    write_html(all_results, page_label, filename=ts_html, term_urls=term_urls)
+    write_csv(all_results, ts_csv)
 
     if not no_browser and all_results:
-        webbrowser.open(f'file://{os.path.abspath(OUTPUT_HTML)}')
+        webbrowser.open(f'file://{os.path.abspath(ts_html)}')
 
-    # Cron: exit 1 if any site returned 0 results, so cron can alert
     if args.cron and had_error:
         sys.exit(1)
 

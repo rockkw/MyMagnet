@@ -357,6 +357,11 @@ PAGE_HTML = r"""<!DOCTYPE html>
              font-size: 1rem; padding: 0; }
   .mag-btn:hover { filter: brightness(1.4); }
 
+  /* ── Detail expand icon ── */
+  .detail-icon { cursor: pointer; margin-left: 0.4rem; color: #555;
+                 font-size: 0.9rem; user-select: none; }
+  .detail-icon:hover { color: #f90; }
+
   /* ── History cards ── */
   .run-card { background: #1a1a1a; border: 1px solid #333;
               border-radius: 6px; margin-bottom: 1rem;
@@ -704,8 +709,13 @@ async function loadLibrary() {
       const lastSeen = r.last_seen ? r.last_seen.slice(0,10) : '—';
       html += `<tr>
         <td><a class="mag-btn" href="${escHtml(r.magnet)}" title="Open magnet link">🧲</a></td>
-        <td><a href="#" onclick="showDetail('${r.info_hash}');return false;">
-            ${escHtml(r.title)}${multiTag}</a></td>
+        <td>
+          <a href="https://www.google.com/search?tbm=isch&q=${encodeURIComponent(r.title)}"
+             target="_blank" title="Search Google Images for "${escHtml(r.title)}"">
+            ${escHtml(r.title)}${multiTag}</a>
+          <span class="detail-icon" onclick="showDetail('${r.info_hash}')"
+                title="Show detail">⋯</span>
+        </td>
         <td>${escHtml(r.size || '?')}</td>
         <td class="seeds">${r.best_seeds}</td>
         <td class="leeches">${r.best_leeches}</td>
