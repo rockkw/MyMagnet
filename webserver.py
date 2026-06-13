@@ -263,6 +263,136 @@ def api_torrent(conn, info_hash: str) -> dict | None:
     return t
 
 
+def api_analyze(conn, search_id: int = 0) -> dict:
+    """
+    Dashboard analysis for a scrape run (defaults to latest).
+    Returns: run metadata, per-category breakdown, per-site breakdown,
+    seed-distribution buckets, and word-frequency heatmap data.
+    """
+    import re as _re
+    from collections import defaultdict
+
+    # ── Resolve run ──────────────────────────────────────────────────────
+    if search_id:
+        run = query_one(conn, "SELECT * FROM searches WHERE id = ?", (search_id,))
+    else:
+        run = query_one(conn, "SELECT * FROM searches ORDER BY run_at DESC LIMIT 1")
+    if not run:
+        return {}
+
+    sid = run['id']
+
+    # ── Full result set for this run ─────────────────────────────────────
+    rows = query(conn, """
+        SELECT t.title, t.best_seeds, t.best_leeches, t.size,
+               sr.search_term, st.category,
+               GROUP_CONCAT(DISTINCT ts.site) AS sites
+        FROM   search_results sr
+        JOIN   torrents t  ON t.info_hash  = sr.info_hash
+        JOIN   search_terms st ON st.term  = sr.search_term
+        LEFT JOIN torrent_sites ts ON ts.info_hash = sr.info_hash
+        WHERE  sr.search_id = ?
+        GROUP  BY sr.info_hash
+        ORDER  BY sr.seeds DESC
+    """, (sid,))
+    for r in rows:
+        r['sites'] = r['sites'].split(',') if r['sites'] else []
+
+    # ── Per-category breakdown ────────────────────────────────────────────
+    cat_map: dict[str, dict] = defaultdict(lambda: {'count': 0, 'total_seeds': 0, 'terms': set()})
+    for r in rows:
+        c = r['category'] or 'Default'
+        cat_map[c]['count']       += 1
+        cat_map[c]['total_seeds'] += r['best_seeds']
+        cat_map[c]['terms'].add(r['search_term'])
+    by_category = [
+        {'category': k, 'count': v['count'],
+         'avg_seeds': round(v['total_seeds'] / v['count'], 1) if v['count'] else 0,
+         'terms': sorted(v['terms'])}
+        for k, v in sorted(cat_map.items(), key=lambda x: -x[1]['count'])
+    ]
+
+    # ── Per-site breakdown ────────────────────────────────────────────────
+    site_map: dict[str, dict] = defaultdict(lambda: {'count': 0, 'total_seeds': 0})
+    for r in rows:
+        for s in r['sites']:
+            site_map[s]['count']       += 1
+            site_map[s]['total_seeds'] += r['best_seeds']
+    by_site = [
+        {'site': k, 'count': v['count'],
+         'avg_seeds': round(v['total_seeds'] / v['count'], 1) if v['count'] else 0}
+        for k, v in sorted(site_map.items(), key=lambda x: -x[1]['count'])
+    ]
+
+    # ── Seed distribution buckets ─────────────────────────────────────────
+    buckets = [
+        {'label': '0',      'min': 0,    'max': 1,    'count': 0},
+        {'label': '1–9',    'min': 1,    'max': 10,   'count': 0},
+        {'label': '10–49',  'min': 10,   'max': 50,   'count': 0},
+        {'label': '50–199', 'min': 50,   'max': 200,  'count': 0},
+        {'label': '200+',   'min': 200,  'max': 10**9,'count': 0},
+    ]
+    for r in rows:
+        s = r['best_seeds']
+        for b in buckets:
+            if b['min'] <= s < b['max']:
+                b['count'] += 1
+                break
+
+    # ── Word heatmap ──────────────────────────────────────────────────────
+    STOPWORDS = {
+        'a','an','the','and','or','of','in','to','for','with','on','at','by',
+        'from','is','it','its','as','be','was','are','been','has','have',
+        'that','this','not','but','so','if','up','do','did','s','1','2','3',
+        '4','5','6','7','8','9','0', 'x265','x264','h264','h265','aac','mkv',
+        'mp4','web','dl','webrip','bluray','remux','hdtv','10bit','5','1080p',
+        '720p','2160p','4k','hdr','sdr','dv','flac','mp3','dvd','bdrip',
+        'repack','proper','extended','theatrical','dc','remastered',
+    }
+    word_seeds: dict[str, list[int]] = defaultdict(list)
+    for r in rows:
+        words = _re.findall(r"[a-zA-Z]{3,}", r['title'])
+        seen_in_title: set[str] = set()
+        for w in words:
+            w = w.lower()
+            if w in STOPWORDS or w in seen_in_title:
+                continue
+            seen_in_title.add(w)
+            word_seeds[w].append(r['best_seeds'])
+
+    word_freq = [
+        {'word': w, 'count': len(seeds),
+         'avg_seeds': round(sum(seeds) / len(seeds), 1)}
+        for w, seeds in word_seeds.items()
+        if len(seeds) >= 2
+    ]
+    word_freq.sort(key=lambda x: -x['count'])
+    word_freq = word_freq[:80]   # cap at 80 words
+
+    # ── Per-search-term breakdown ─────────────────────────────────────────
+    term_map: dict[str, dict] = defaultdict(lambda: {'count': 0, 'total_seeds': 0, 'category': ''})
+    for r in rows:
+        t = r['search_term']
+        term_map[t]['count']       += 1
+        term_map[t]['total_seeds'] += r['best_seeds']
+        term_map[t]['category']     = r['category']
+    by_term = [
+        {'term': k, 'category': v['category'], 'count': v['count'],
+         'avg_seeds': round(v['total_seeds'] / v['count'], 1) if v['count'] else 0}
+        for k, v in sorted(term_map.items(), key=lambda x: -x[1]['count'])
+    ]
+
+    return {
+        'run':         dict(run),
+        'total':       len(rows),
+        'by_category': by_category,
+        'by_site':     by_site,
+        'by_term':     by_term,
+        'seed_dist':   buckets,
+        'word_cloud':  word_freq,
+    }
+
+
 def api_searches(conn) -> list[dict]:
     return query(conn,
         "SELECT * FROM searches ORDER BY run_at DESC LIMIT 100")
@@ -442,6 +572,46 @@ PAGE_HTML = r"""<!DOCTYPE html>
   #purge-btn:hover  { background: #c44; color: #fff; }
   #purge-btn:active { transform: scale(0.97); }
 
+  /* ── Analyze page ── */
+  .az-grid { display: grid; gap: 1.5rem;
+             grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+             margin-bottom: 1.5rem; }
+  .az-card { background: #1a1a1a; border: 1px solid #333; border-radius: 8px;
+             padding: 1rem 1.2rem; }
+  .az-card h3 { margin: 0 0 0.9rem; color: #f90; font-size: 0.9rem;
+                text-transform: uppercase; letter-spacing: 0.06em; }
+  .az-run-meta { font-size: 0.82rem; color: #888; margin-bottom: 1.5rem; }
+  .az-run-meta strong { color: #eee; }
+
+  /* bar rows */
+  .bar-row { display: flex; align-items: center; gap: 0.5rem;
+             margin-bottom: 0.45rem; font-size: 0.8rem; }
+  .bar-label { width: 130px; flex-shrink: 0; color: #ccc;
+               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar-track { flex: 1; background: #2a2a2a; border-radius: 3px; height: 14px;
+               position: relative; overflow: hidden; }
+  .bar-fill  { height: 100%; border-radius: 3px;
+               transition: width 0.4s ease; }
+  .bar-val   { width: 48px; flex-shrink: 0; text-align: right;
+               color: #888; font-size: 0.75rem; }
+
+  /* seed bucket bars — amber */
+  .bar-fill.seeds  { background: linear-gradient(90deg, #b36000, #f90); }
+  /* category bars — teal */
+  .bar-fill.cat    { background: linear-gradient(90deg, #006060, #0cf); }
+  /* site bars — purple */
+  .bar-fill.site   { background: linear-gradient(90deg, #3a006a, #c8f); }
+  /* term bars — green */
+  .bar-fill.term   { background: linear-gradient(90deg, #004010, #4c4); }
+
+  /* word cloud */
+  .word-cloud { display: flex; flex-wrap: wrap; gap: 0.4rem;
+                align-items: baseline; line-height: 1.6;
+                padding: 0.4rem 0; }
+  .wc-word { cursor: default; border-radius: 3px; padding: 0.1rem 0.35rem;
+             transition: filter 0.15s; white-space: nowrap; }
+  .wc-word:hover { filter: brightness(1.35); }
+
   /* ── Purge confirm overlay ── */
   #purge-overlay { display: none; position: fixed; inset: 0;
                    background: rgba(0,0,0,0.75); z-index: 500;
@@ -470,6 +640,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
 <div id="navbar">
   <h1>🧲 Magnet Library</h1>
   <a class="nav-link active" href="#" onclick="showPage('library',this)">Library</a>
+  <a class="nav-link"        href="#" onclick="showPage('analyze',this)">Analyze</a>
   <a class="nav-link"        href="#" onclick="showPage('history',this)">History</a>
   <div id="stats-bar">
     <span id="stat-torrents">— torrents</span>
@@ -530,6 +701,16 @@ PAGE_HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<!-- ── Analyze page ─────────────────────────────────────────────────── -->
+<div id="page-analyze" class="page">
+  <div class="toolbar" style="margin-bottom:0.75rem">
+    <select id="analyze-run-sel" onchange="loadAnalyze()" style="min-width:260px">
+      <option value="0">Latest run</option>
+    </select>
+  </div>
+  <div id="analyze-wrap"><p class="loading">Loading…</p></div>
+</div>
+
 <!-- ── History page ─────────────────────────────────────────────────── -->
 <div id="page-history" class="page">
   <div id="history-wrap"><p class="loading">Loading…</p></div>
@@ -557,6 +738,7 @@ function showPage(name, el) {
   document.getElementById('page-' + name).classList.add('active');
   if (el) el.classList.add('active');
   if (name === 'library') loadLibrary();
+  if (name === 'analyze') loadAnalyze();
   if (name === 'history') loadHistory();
   return false;
 }
@@ -745,6 +927,150 @@ function setSortAndLoad(col) {
   document.getElementById('lib-sort').value = col;
   libOffset = 0;
   loadLibrary();
+}
+
+// ── Analyze ────────────────────────────────────────────────────────────────
+async function populateRunSelector() {
+  try {
+    const runs = await apiFetch('/api/searches');
+    const sel  = document.getElementById('analyze-run-sel');
+    // keep the "Latest run" option, add one per run
+    runs.forEach(r => {
+      const opt = document.createElement('option');
+      opt.value       = r.id;
+      opt.textContent = `${r.run_at.slice(0,16).replace('T',' ')} — ${r.terms} (${r.total_found} results)`;
+      sel.appendChild(opt);
+    });
+  } catch(e) { console.warn('Run selector load failed', e); }
+}
+
+async function loadAnalyze() {
+  const sid = document.getElementById('analyze-run-sel').value || '0';
+  document.getElementById('analyze-wrap').innerHTML =
+    '<p class="loading">Loading analysis…</p>';
+  try {
+    const d = await apiFetch(`/api/analyze?run=${sid}`);
+    renderAnalyze(d);
+  } catch(e) {
+    document.getElementById('analyze-wrap').innerHTML =
+      `<p class="empty">Error: ${e.message}</p>`;
+  }
+}
+
+function renderAnalyze(d) {
+  if (!d || !d.run) {
+    document.getElementById('analyze-wrap').innerHTML =
+      '<p class="empty">No scrape runs found. Run magnetlookup.py first.</p>';
+    return;
+  }
+  const r   = d.run;
+  const dt  = r.run_at.slice(0,16).replace('T',' ');
+  const mode = r.js_mode ? ' · JS mode' : '';
+
+  // ── helper: bar chart section ─────────────────────────────────────────
+  function barChart(items, labelKey, valKey, cls, maxVal, suffix='') {
+    if (!items.length) return '<p class="empty" style="font-size:0.8rem">No data.</p>';
+    return items.map(item => {
+      const pct = maxVal > 0 ? Math.round(item[valKey] / maxVal * 100) : 0;
+      return `<div class="bar-row">
+        <span class="bar-label" title="${escHtml(String(item[labelKey]))}">${escHtml(String(item[labelKey]))}</span>
+        <div class="bar-track">
+          <div class="bar-fill ${cls}" style="width:${pct}%"></div>
+        </div>
+        <span class="bar-val">${item[valKey]}${suffix}</span>
+      </div>`;
+    }).join('');
+  }
+
+  // ── seed distribution ─────────────────────────────────────────────────
+  const maxBucket = Math.max(...d.seed_dist.map(b => b.count), 1);
+  const seedBars  = barChart(d.seed_dist, 'label', 'count', 'seeds', maxBucket);
+
+  // ── category bars ─────────────────────────────────────────────────────
+  const maxCat = Math.max(...d.by_category.map(c => c.count), 1);
+  const catBars = barChart(d.by_category, 'category', 'count', 'cat', maxCat);
+
+  // ── site bars ─────────────────────────────────────────────────────────
+  const maxSite = Math.max(...d.by_site.map(s => s.count), 1);
+  const siteBars = barChart(d.by_site, 'site', 'count', 'site', maxSite);
+
+  // ── term bars ─────────────────────────────────────────────────────────
+  const maxTerm = Math.max(...d.by_term.map(t => t.count), 1);
+  const termBars = barChart(d.by_term, 'term', 'count', 'term', maxTerm);
+
+  // ── word cloud ────────────────────────────────────────────────────────
+  // Font size: scale 0.7rem–2.2rem by count. Colour: seed-heat amber↔teal.
+  const words = d.word_cloud;
+  let cloudHtml = '<p class="empty" style="font-size:0.8rem">Not enough title data.</p>';
+  if (words.length) {
+    const maxCount = Math.max(...words.map(w => w.count));
+    const minCount = Math.min(...words.map(w => w.count));
+    const maxSeeds = Math.max(...words.map(w => w.avg_seeds), 1);
+
+    cloudHtml = '<div class="word-cloud">' +
+      words.map(w => {
+        const t   = maxCount > minCount ? (w.count - minCount) / (maxCount - minCount) : 1;
+        const em  = (0.72 + t * 1.6).toFixed(2);
+        // seed heat: 0 = cool blue (#4af), 1 = hot amber (#f90)
+        const h   = maxSeeds > 0 ? w.avg_seeds / maxSeeds : 0;
+        const r_  = Math.round(68  + h * (255 - 68));
+        const g_  = Math.round(170 + h * (153 - 170));
+        const b_  = Math.round(255 + h * (0   - 255));
+        const col = `rgb(${r_},${g_},${b_})`;
+        const bg  = `rgba(${r_},${g_},${b_},0.10)`;
+        return `<span class="wc-word"
+          style="font-size:${em}rem;color:${col};background:${bg};border:1px solid rgba(${r_},${g_},${b_},0.25)"
+          title="${escHtml(w.word)}: ${w.count} titles · avg ${w.avg_seeds} seeds">${escHtml(w.word)}</span>`;
+      }).join('') + '</div>';
+  }
+
+  // ── avg seeds per category (secondary bar) ────────────────────────────
+  const maxAvgCat = Math.max(...d.by_category.map(c => c.avg_seeds), 1);
+  const catAvgBars = d.by_category.map(c => {
+    const pct = Math.round(c.avg_seeds / maxAvgCat * 100);
+    return `<div class="bar-row">
+      <span class="bar-label">${escHtml(c.category)}</span>
+      <div class="bar-track">
+        <div class="bar-fill seeds" style="width:${pct}%"></div>
+      </div>
+      <span class="bar-val">${c.avg_seeds}</span>
+    </div>`;
+  }).join('');
+
+  document.getElementById('analyze-wrap').innerHTML = `
+    <p class="az-run-meta">
+      Run: <strong>${dt}</strong>${escHtml(mode)} &nbsp;·&nbsp;
+      Terms: <strong>${escHtml(r.terms)}</strong> &nbsp;·&nbsp;
+      <strong>${d.total}</strong> result(s) &nbsp;·&nbsp;
+      ${r.dupes_removed} duplicate(s) removed
+    </p>
+
+    <div class="az-grid">
+      <div class="az-card">
+        <h3>Seeds Distribution</h3>${seedBars}
+      </div>
+      <div class="az-card">
+        <h3>Results by Category</h3>${catBars}
+      </div>
+      <div class="az-card">
+        <h3>Avg Seeds by Category</h3>${catAvgBars || '<p class="empty" style="font-size:0.8rem">No data.</p>'}
+      </div>
+      <div class="az-card">
+        <h3>Results by Site</h3>${siteBars}
+      </div>
+      <div class="az-card">
+        <h3>Results by Search Term</h3>${termBars}
+      </div>
+    </div>
+
+    <div class="az-card" style="margin-bottom:1.5rem">
+      <h3>Word Heatmap — Title Tokens
+        <span style="font-size:0.72rem;font-weight:400;color:#888;margin-left:0.5rem">
+          size = frequency · colour = avg seeds (blue=low → amber=high)
+        </span>
+      </h3>
+      ${cloudHtml}
+    </div>`;
 }
 
 // ── History ────────────────────────────────────────────────────────────────
@@ -946,6 +1272,7 @@ document.getElementById('purge-overlay').addEventListener('click', function(e) {
 loadStats();
 loadCategories();
 loadLibrary();
+populateRunSelector();
 </script>
 </body>
 </html>
@@ -1050,6 +1377,11 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(t)
                 else:
                     self._send_404()
+
+            # ── API: analyze ──────────────────────────────────────────────
+            elif path == '/api/analyze':
+                sid = int(qs1('run', '0'))
+                self._send_json(api_analyze(conn, sid))
 
             # ── API: search history ───────────────────────────────────────
             elif path == '/api/searches':
