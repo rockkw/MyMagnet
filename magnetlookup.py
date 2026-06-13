@@ -128,8 +128,18 @@ DEFAULT_DB_FILE     = _path('paths', 'db_file',
     str(Path.home() / 'Documents/Development/magnet_library.db'))
 DEFAULT_LOG_DIR     = _path('paths', 'log_dir',
     str(Path.home() / 'Documents/Development/logs'))
-OUTPUT_HTML         = 'magnet_results.html'
-OUTPUT_CSV          = 'magnet_results.csv'
+DEFAULT_OUTPUT_DIR  = _path('paths', 'output_dir',
+    str(Path.home() / 'Documents/Development/magnet_results'))
+
+def _output(filename: str) -> str:
+    d = Path(DEFAULT_OUTPUT_DIR)
+    d.mkdir(parents=True, exist_ok=True)
+    stem, _, ext = filename.rpartition('.')
+    ts = datetime.now().strftime('%Y-%m-%d_%H-%M')
+    return str(d / f'{stem}_{ts}.{ext}')
+
+OUTPUT_HTML = _output('magnet_results.html')
+OUTPUT_CSV  = _output('magnet_results.csv')
 
 JS_RENDER_TIMEOUT   = _int('scraper', 'js_render_timeout', 10)
 JS_SETTLE_PAUSE     = _int('scraper', 'js_settle_pause', 2)
@@ -715,37 +725,55 @@ def open_db(db_path: str) -> sqlite3.Connection:
     log.info(f'Database: {db_path}')
     return conn
 
-def write_db(conn: sqlite3.Connection,
-             all_results: list[dict],
-             deduped: list[dict],
-             jobs: list[tuple[str, str, list[str]]],
-             js_mode: bool,
-             deduped_count: int):
+def write_db_term(conn: sqlite3.Connection,
+                  term_results: list[dict],
+                  label: str,
+                  category: str,
+                  js_mode: bool):
     """
-    Persist scrape results to SQLite.
-    - Upserts each unique torrent (updates seed count if higher).
-    - Records which sites carried each torrent.
-    - Logs the scrape run and links results to it.
-    - Upserts categories and tags search terms with their category.
-    jobs: list of (label, category, urls)
+    Persist results for a single search term to SQLite and commit immediately.
+    Called once per term so progress is saved even if a later term fails.
     """
-    now       = datetime.now().isoformat(timespec='seconds')
-    terms_str = ', '.join(label for label, _, __ in jobs)
+    now = datetime.now().isoformat(timespec='seconds')
+
+    def seed_int(r: dict) -> int:
+        try:
+            return int(str(r.get('seeds', '0')).strip())
+        except ValueError:
+            return 0
+
+    def seeded(r: dict) -> bool:
+        s = str(r.get('seeds', '0')).strip()
+        try:
+            return int(s) > 0
+        except ValueError:
+            return s not in ('0', '?', '')
+
+    from collections import defaultdict
+    shown = [r for r in term_results if seeded(r)]
+    hash_copies: dict[str, list[dict]] = defaultdict(list)
+    for r in shown:
+        ih = r.get('info_hash', '') or str(id(r))
+        hash_copies[ih].append(r)
+
+    deduped: list[dict] = []
+    for ih, copies in hash_copies.items():
+        best = dict(max(copies, key=seed_int))
+        best['found_on'] = sorted({urlparse(c['source_url']).netloc for c in copies})
+        deduped.append(best)
+
+    deduped_count = len(shown) - len(deduped)
 
     # ── Insert scrape run ─────────────────────────────────────────────────
     cur = conn.execute(
         "INSERT INTO searches (run_at, terms, js_mode, total_found, dupes_removed) "
         "VALUES (?, ?, ?, ?, ?)",
-        (now, terms_str, int(js_mode), len(deduped), deduped_count)
+        (now, label, int(js_mode), len(deduped), deduped_count)
     )
     search_id = cur.lastrowid
 
-    # ── Upsert categories first (terms reference them) ────────────────────
-    cats = {cat for _, cat, __ in jobs}
-    for cat in cats:
-        conn.execute(
-            "INSERT OR IGNORE INTO categories (name) VALUES (?)", (cat,)
-        )
+    # ── Upsert category ───────────────────────────────────────────────────
+    conn.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (category,))
 
     # ── Upsert each unique torrent ────────────────────────────────────────
     for r in deduped:
@@ -765,7 +793,6 @@ def write_db(conn: sqlite3.Connection,
         except ValueError:
             pass
 
-        # Insert or update — if hash exists, update seed count if higher
         conn.execute("""
             INSERT INTO torrents (info_hash, title, size, best_seeds,
                                   best_leeches, first_seen, last_seen, magnet)
@@ -779,35 +806,32 @@ def write_db(conn: sqlite3.Connection,
         """, (ih, r['title'], r.get('size', '?'), seeds, leeches,
               now, now, r['magnet']))
 
-        # Record which sites carried this torrent
         for site in r.get('found_on', [urlparse(r['source_url']).netloc]):
             conn.execute(
                 "INSERT OR IGNORE INTO torrent_sites (info_hash, site) VALUES (?, ?)",
                 (ih, site)
             )
 
-        # Link to this search run
         conn.execute(
             "INSERT INTO search_results (search_id, info_hash, search_term, seeds) "
             "VALUES (?, ?, ?, ?)",
-            (search_id, ih, r.get('search_term', ''), seeds)
+            (search_id, ih, label, seeds)
         )
 
-    # ── Upsert each unique search term used in this run ─────────────────
-    for label, category, _ in jobs:
-        conn.execute(
-            "INSERT INTO search_terms "
-            "    (term, category, first_used, last_used, use_count) "
-            "VALUES (?, ?, ?, ?, 1) "
-            "ON CONFLICT(term) DO UPDATE SET "
-            "    category  = excluded.category, "
-            "    last_used = excluded.last_used, "
-            "    use_count = use_count + 1",
-            (label, category, now, now)
-        )
+    # ── Upsert search term ────────────────────────────────────────────────
+    conn.execute(
+        "INSERT INTO search_terms "
+        "    (term, category, first_used, last_used, use_count) "
+        "VALUES (?, ?, ?, ?, 1) "
+        "ON CONFLICT(term) DO UPDATE SET "
+        "    category  = excluded.category, "
+        "    last_used = excluded.last_used, "
+        "    use_count = use_count + 1",
+        (label, category, now, now)
+    )
 
     conn.commit()
-    log.info(f'DB: {len(deduped)} torrents written (run id={search_id})')
+    log.info(f'DB [{label}]: {len(deduped)} torrents committed (run id={search_id})')
     return search_id
 
 
@@ -1415,6 +1439,14 @@ def main():
             urls = build_search_urls(term, args.urls_file)
             jobs.append((term, category, urls))
 
+    # ── Database connection (opened once, committed per term) ─────────────
+    conn = None
+    if not args.no_db:
+        try:
+            conn = open_db(args.db)
+        except Exception as e:
+            log.error(f'DB open failed: {e}')
+
     # ── Scrape ────────────────────────────────────────────────────────────
     all_results: list[dict] = []
     had_error = False
@@ -1423,13 +1455,14 @@ def main():
         if len(jobs) > 1:
             log.info(f'[{idx+1}/{len(jobs)}] [{category}] {label}')
 
+        term_results: list[dict] = []
         for i, url in enumerate(urls):
             try:
                 results = scrape(url, js_mode=args.js)
                 for r in results:
                     r['search_term'] = label
                     r['category']    = category
-                all_results.extend(results)
+                term_results.extend(results)
                 if not results:
                     log.warning(f'0 results from {urlparse(url).netloc}')
                     had_error = True
@@ -1438,6 +1471,19 @@ def main():
                 had_error = True
             if i < len(urls) - 1:
                 time.sleep(args.delay)
+
+        all_results.extend(term_results)
+
+        # Commit this term's results before moving to the next term
+        if conn is not None:
+            try:
+                write_db_term(conn, term_results, label, category, args.js)
+            except Exception as e:
+                log.error(f'DB write failed for [{label}]: {e}')
+                had_error = True
+
+    if conn is not None:
+        conn.close()
 
     # ── Deduplicate (mirrors write_html logic — shared helper) ────────────
     def seed_int(r: dict) -> int:
@@ -1476,17 +1522,6 @@ def main():
     print_summary(all_results)
     write_html(all_results, page_label, term_urls=term_urls)
     write_csv(all_results)
-
-    # ── Database ──────────────────────────────────────────────────────────
-    if not args.no_db:
-        try:
-            conn = open_db(args.db)
-            write_db(conn, all_results, deduped, jobs,
-                     args.js, deduped_count)
-            conn.close()
-        except Exception as e:
-            log.error(f'DB write failed: {e}')
-            had_error = True
 
     if not no_browser and all_results:
         webbrowser.open(f'file://{os.path.abspath(OUTPUT_HTML)}')

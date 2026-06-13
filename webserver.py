@@ -24,9 +24,8 @@ API (JSON):
     /api/stats                  Counts for dashboard header
 """
 
-import os
 import sys
-import re
+import os
 import json
 import sqlite3
 import argparse
@@ -35,56 +34,104 @@ import configparser
 from pathlib import Path
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs, unquote, urlencode
-import urllib.request
+from urllib.parse import urlparse, parse_qs, unquote
 
-# ── Config ───────────────────────────────────────────────────────────────────
-def _expand(value: str) -> str:
-    result = []
-    i = 0
-    while i < len(value):
-        if value[i] == '$' and i + 1 < len(value) and value[i + 1] == '{':
-            depth, j = 0, i + 1
-            while j < len(value):
-                if value[j] == '{':
-                    depth += 1
-                elif value[j] == '}':
-                    depth -= 1
-                    if depth == 0:
-                        break
-                j += 1
-            var, _, default = value[i + 2:j].partition(':-')
-            resolved = os.environ.get(var)
-            result.append(resolved if resolved is not None else _expand(default))
-            i = j + 1
-        elif value[i] == '$' and i + 1 < len(value) and (value[i + 1].isalpha() or value[i + 1] == '_'):
-            m = re.match(r'[A-Za-z_][A-Za-z0-9_]*', value[i + 1:])
-            result.append(os.environ.get(m.group(), '') if m else '$')
-            i += 1 + (len(m.group()) if m else 0)
-        else:
-            result.append(value[i])
-            i += 1
-    return ''.join(result)
+# ── Defaults (read from config.ini if present, else fall back) ───────────────
+def _load_config() -> configparser.ConfigParser:
+    cfg = configparser.ConfigParser()
+    cfg_path = Path(__file__).parent / 'config.ini'
+    if cfg_path.exists():
+        import re as _re
+        raw = cfg_path.read_text()
+        def _expand_plain(m):
+            return os.environ.get(m.group(1), m.group(0))
+        raw = _re.sub(r'\$\{([^}:]+)\}', _expand_plain, raw)
+        raw = os.path.expandvars(raw)
+        def _expand_default(m):
+            var, _, default = m.group(1).partition(':-')
+            return os.environ.get(var.strip(), default.strip())
+        raw = _re.sub(r'\$\{([^}]+)\}', _expand_default, raw)
+        cfg.read_string(raw)
+    return cfg
 
-_cfg = configparser.RawConfigParser()
-_cfg_path = Path(__file__).with_name('config.ini')
-if not _cfg.read(_cfg_path):
-    print(f'[WARN] config.ini not found at {_cfg_path} — using built-in defaults')
+_cfg = _load_config()
 
-def _get(section, key, fallback):
-    raw = _cfg.get(section, key, fallback=None)
-    return _expand(raw) if raw is not None else fallback
+def _cfg_get(section, key, fallback):
+    try:
+        return os.path.expanduser(_cfg.get(section, key))
+    except (configparser.NoSectionError, configparser.NoOptionError):
+        return fallback
 
-DEFAULT_DB   = _get('paths',  'db_file', os.path.expanduser('~/Documents/Development/magnet_library.db'))
-DEFAULT_PORT = int(_get('server', 'port', '8080'))
+def _cfg_int(section, key, fallback):
+    try:
+        return _cfg.getint(section, key)
+    except (configparser.NoSectionError, configparser.NoOptionError, ValueError):
+        return fallback
+
+DEFAULT_DB   = _cfg_get('paths', 'db_file',
+    str(Path.home() / 'Documents/Development/magnet_library.db'))
+DEFAULT_PORT = _cfg_int('server', 'port', 8080)
 
 # ══════════════════════════════════════════════════════════════════════════
 # Database helpers
 # ══════════════════════════════════════════════════════════════════════════
 
+_DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS searches (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_at      TEXT    NOT NULL,
+    terms       TEXT    NOT NULL,
+    js_mode     INTEGER NOT NULL DEFAULT 0,
+    total_found INTEGER NOT NULL DEFAULT 0,
+    dupes_removed INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS torrents (
+    info_hash   TEXT PRIMARY KEY,
+    title       TEXT NOT NULL,
+    size        TEXT,
+    best_seeds  INTEGER NOT NULL DEFAULT 0,
+    best_leeches INTEGER NOT NULL DEFAULT 0,
+    first_seen  TEXT NOT NULL,
+    last_seen   TEXT NOT NULL,
+    magnet      TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS torrent_sites (
+    info_hash   TEXT NOT NULL REFERENCES torrents(info_hash),
+    site        TEXT NOT NULL,
+    PRIMARY KEY (info_hash, site)
+);
+CREATE TABLE IF NOT EXISTS search_results (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    search_id   INTEGER NOT NULL REFERENCES searches(id),
+    info_hash   TEXT    NOT NULL REFERENCES torrents(info_hash),
+    search_term TEXT    NOT NULL,
+    seeds       INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS categories (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT UNIQUE NOT NULL
+);
+CREATE TABLE IF NOT EXISTS search_terms (
+    term        TEXT PRIMARY KEY,
+    category    TEXT NOT NULL DEFAULT 'Default',
+    first_used  TEXT NOT NULL,
+    last_used   TEXT NOT NULL,
+    use_count   INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_sr_search  ON search_results(search_id);
+CREATE INDEX IF NOT EXISTS idx_sr_term    ON search_results(search_term);
+CREATE INDEX IF NOT EXISTS idx_sr_hash    ON search_results(info_hash);
+CREATE INDEX IF NOT EXISTS idx_t_seeds    ON torrents(best_seeds DESC);
+CREATE INDEX IF NOT EXISTS idx_t_seen     ON torrents(last_seen DESC);
+CREATE INDEX IF NOT EXISTS idx_terms_used ON search_terms(last_used DESC);
+CREATE INDEX IF NOT EXISTS idx_terms_cat  ON search_terms(category);
+"""
+
 def get_db(db_path: str) -> sqlite3.Connection:
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.executescript(_DB_SCHEMA)
     return conn
 
 
@@ -115,10 +162,27 @@ def api_stats(conn) -> dict:
     }
 
 
-def api_terms(conn) -> list[dict]:
-    """Return all stored search terms ordered by most recently used."""
+def api_categories(conn) -> list[dict]:
+    """Return all categories that have at least one search term."""
     return query(conn,
-        "SELECT term, use_count, last_used FROM search_terms "
+        "SELECT DISTINCT category, COUNT(*) AS term_count "
+        "FROM search_terms "
+        "GROUP BY category "
+        "ORDER BY category ASC")
+
+
+def api_terms(conn, category: str = '') -> list[dict]:
+    """
+    Return all stored search terms ordered by most recently used.
+    Optionally filter by category.
+    """
+    if category:
+        return query(conn,
+            "SELECT term, category, use_count, last_used FROM search_terms "
+            "WHERE category = ? "
+            "ORDER BY last_used DESC", (category,))
+    return query(conn,
+        "SELECT term, category, use_count, last_used FROM search_terms "
         "ORDER BY last_used DESC")
 
 
@@ -128,7 +192,7 @@ def api_purge(conn) -> dict:
     Schema (tables + indexes) is preserved — only data is removed.
     """
     tables = ['search_results', 'torrent_sites', 'torrents',
-              'searches', 'search_terms']
+              'searches', 'search_terms', 'categories']
     for t in tables:
         conn.execute(f'DELETE FROM {t}')
     # Reset SQLite autoincrement counters
@@ -138,49 +202,8 @@ def api_purge(conn) -> dict:
     return {'purged': True, 'tables': tables}
 
 
-def api_image_preview(title: str, count: int = 6) -> list[str]:
-    """
-    Fetch thumbnail URLs via DuckDuckGo image search (no API key needed).
-    Step 1: load the search page to obtain the vqd session token.
-    Step 2: call the i.js JSON endpoint with that token.
-    Returns up to `count` thumbnail URLs.
-    """
-    headers = {
-        'User-Agent': (
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) '
-            'Chrome/124.0.0.0 Safari/537.36'
-        ),
-        'Accept-Language': 'en-US,en;q=0.9',
-    }
-
-    # Step 1 — get vqd token
-    qs1 = urlencode({'q': title, 'iax': 'images', 'ia': 'images'})
-    req1 = urllib.request.Request(
-        f'https://duckduckgo.com/?{qs1}', headers=headers)
-    with urllib.request.urlopen(req1, timeout=8) as r:
-        html = r.read().decode('utf-8', errors='replace')
-
-    m = re.search(r'vqd=([\w-]+)', html)
-    if not m:
-        return []
-    vqd = m.group(1)
-
-    # Step 2 — fetch image results JSON
-    qs2 = urlencode({'l': 'us-en', 'o': 'json', 'q': title,
-                     'vqd': vqd, 'f': ',,,,,', 'p': '1'})
-    req2 = urllib.request.Request(
-        f'https://duckduckgo.com/i.js?{qs2}',
-        headers={**headers, 'Referer': 'https://duckduckgo.com/'})
-    with urllib.request.urlopen(req2, timeout=8) as r:
-        data = json.loads(r.read().decode())
-
-    return [item['thumbnail'] for item in data.get('results', [])
-            if item.get('thumbnail')][:count]
-
-
 def api_torrents(conn, q='', sort='best_seeds', order='desc',
-                 limit=200, offset=0, term='') -> list[dict]:
+                 limit=200, offset=0, term='', category='') -> list[dict]:
     allowed_sort = {'best_seeds', 'best_leeches', 'title', 'last_seen',
                     'first_seen', 'size'}
     sort  = sort  if sort  in allowed_sort else 'best_seeds'
@@ -198,6 +221,13 @@ def api_torrents(conn, q='', sort='best_seeds', order='desc',
             SELECT DISTINCT info_hash FROM search_results
             WHERE search_term LIKE ?)""")
         params.append(f'%{term}%')
+
+    if category:
+        where.append("""t.info_hash IN (
+            SELECT DISTINCT sr.info_hash FROM search_results sr
+            JOIN search_terms st ON st.term = sr.search_term
+            WHERE st.category = ?)""")
+        params.append(category)
 
     sql = f"""
         SELECT t.*,
@@ -357,7 +387,23 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .loading { color: #888; padding: 2rem; text-align: center; }
   .empty   { color: #555; padding: 2rem; text-align: center; }
 
-  /* ── Term filter pills ── */
+  /* ── Category + term filter rows ── */
+  .filter-row  { display: flex; flex-wrap: wrap; gap: 0.4rem;
+                 margin-bottom: 0.5rem; align-items: center; }
+  .filter-label { font-size: 0.72rem; color: #555; white-space: nowrap;
+                  margin-right: 0.2rem; text-transform: uppercase;
+                  letter-spacing: 0.05em; min-width: 60px; }
+
+  /* Category pills — amber accent */
+  .cat-pill   { cursor: pointer; font-size: 0.78rem; padding: 0.2rem 0.65rem;
+                border-radius: 4px; border: 1px solid #554400;
+                background: #1a1500; color: #aa8800;
+                transition: all 0.15s; white-space: nowrap; }
+  .cat-pill:hover  { border-color: #f90; color: #f90; }
+  .cat-pill.active { background: #f90; color: #111;
+                     border-color: #f90; font-weight: 600; }
+
+  /* Term filter pills ── */
   .term-bar   { display: flex; flex-wrap: wrap; gap: 0.4rem;
                 margin-bottom: 0.75rem; align-items: center; }
   .term-label { font-size: 0.75rem; color: #666; white-space: nowrap;
@@ -381,22 +427,6 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .pg-btn:hover { border-color: #f90; color: #f90; }
   .pg-btn:disabled { opacity: 0.35; cursor: default; }
   .pg-info { color: #888; }
-
-  /* ── Image hover preview ── */
-  #img-tooltip { position: fixed; z-index: 9999; pointer-events: none;
-                 background: #1a1a1a; border: 1px solid #f90;
-                 border-radius: 6px; padding: 6px; box-shadow: 0 4px 20px rgba(0,0,0,0.7);
-                 display: none; max-width: 340px; }
-  #img-tooltip.visible { display: flex; flex-wrap: wrap; gap: 4px; }
-  #img-tooltip img { width: 100px; height: 70px; object-fit: cover;
-                     border-radius: 3px; display: block; }
-  #img-tooltip .tip-label { width: 100%; font-size: 0.7rem; color: #888;
-                             padding: 2px 2px 0; white-space: nowrap;
-                             overflow: hidden; text-overflow: ellipsis; }
-  #img-tooltip .tip-spinner { color: #888; font-size: 0.8rem;
-                               padding: 0.5rem 1rem; }
-  #img-tooltip .tip-none { color: #666; font-size: 0.8rem;
-                            padding: 0.5rem 1rem; }
 
   /* ── Purge button ── */
   #purge-btn { cursor: pointer; background: #2a0a0a; color: #c44;
@@ -463,8 +493,12 @@ PAGE_HTML = r"""<!DOCTYPE html>
 
 <!-- ── Library page ─────────────────────────────────────────────────── -->
 <div id="page-library" class="page active">
+  <div class="filter-row" id="cat-bar">
+    <span class="filter-label">Category:</span>
+    <span class="cat-pill active" onclick="setCategory('')">All</span>
+  </div>
   <div class="term-bar" id="term-bar">
-    <span class="term-label">Filter by term:</span>
+    <span class="term-label">Term:</span>
     <span class="term-pill all-pill active" onclick="setTerm('')">All</span>
   </div>
   <div class="toolbar">
@@ -496,9 +530,6 @@ PAGE_HTML = r"""<!DOCTYPE html>
   <div id="history-wrap"><p class="loading">Loading…</p></div>
 </div>
 
-<!-- ── Image hover tooltip ──────────────────────────────────────────── -->
-<div id="img-tooltip"></div>
-
 <!-- ── Detail panel ─────────────────────────────────────────────────── -->
 <div id="detail-panel">
   <span id="detail-close" onclick="closeDetail()">×</span>
@@ -508,10 +539,11 @@ PAGE_HTML = r"""<!DOCTYPE html>
 
 <script>
 // ── State ─────────────────────────────────────────────────────────────────
-let libOffset    = 0;
-let libTotal     = 0;
-let searchTimer  = null;
-let activeTerm   = '';   // currently selected search term filter ('')= all
+let libOffset      = 0;
+let libTotal       = 0;
+let searchTimer    = null;
+let activeTerm     = '';   // currently selected search term ('' = all)
+let activeCategory = '';   // currently selected category   ('' = all)
 
 // ── Page switching ─────────────────────────────────────────────────────────
 function showPage(name, el) {
@@ -558,17 +590,62 @@ function changePage(dir) {
   loadLibrary();
 }
 
-// ── Term filter pills ──────────────────────────────────────────────────────
-async function loadTerms() {
+// ── Category filter pills ─────────────────────────────────────────────────
+async function loadCategories() {
   try {
-    const terms = await apiFetch('/api/terms');
+    const cats = await apiFetch('/api/categories');
+    const bar  = document.getElementById('cat-bar');
+    // Clear all pills except the hardcoded "All"
+    Array.from(bar.querySelectorAll('.cat-pill:not(:first-of-type)'))
+         .forEach(p => p.remove());
+    cats.forEach(c => {
+      const pill = document.createElement('span');
+      pill.className   = 'cat-pill';
+      pill.textContent = c.category;
+      pill.title       = `${c.term_count} term(s)`;
+      pill.onclick     = () => setCategory(c.category);
+      bar.appendChild(pill);
+    });
+  } catch(e) { console.warn('Categories load failed', e); }
+}
+
+function setCategory(cat) {
+  activeCategory = cat;
+  activeTerm     = '';   // clear term selection when category changes
+  libOffset      = 0;
+
+  // Update category pill states
+  document.querySelectorAll('.cat-pill').forEach(p => {
+    const active = cat === '' ? p.textContent === 'All'
+                              : p.textContent === cat;
+    p.classList.toggle('active', active);
+  });
+
+  // Reload term pills filtered by selected category then reload library
+  loadTerms(cat);
+  loadLibrary();
+}
+
+// ── Term filter pills ──────────────────────────────────────────────────────
+async function loadTerms(categoryFilter = '') {
+  try {
+    const url   = categoryFilter
+                  ? `/api/terms?category=${encodeURIComponent(categoryFilter)}`
+                  : '/api/terms';
+    const terms = await apiFetch(url);
     const bar   = document.getElementById('term-bar');
-    // Keep the "All" pill, append one pill per stored term
+
+    // Rebuild — keep only the "All" pill then append fresh pills
+    Array.from(bar.querySelectorAll('.term-pill:not(.all-pill)'))
+         .forEach(p => p.remove());
+    // Reset All pill to active since we cleared activeTerm
+    bar.querySelector('.all-pill').classList.add('active');
+
     terms.forEach(t => {
       const pill = document.createElement('span');
       pill.className   = 'term-pill';
       pill.textContent = t.term;
-      pill.title       = `Used ${t.use_count}× · last: ${t.last_used.slice(0,10)}`;
+      pill.title       = `[${t.category}] · Used ${t.use_count}× · last: ${t.last_used.slice(0,10)}`;
       pill.onclick     = () => setTerm(t.term);
       bar.appendChild(pill);
     });
@@ -578,7 +655,6 @@ async function loadTerms() {
 function setTerm(term) {
   activeTerm = term;
   libOffset  = 0;
-  // Update pill active states
   document.querySelectorAll('.term-pill').forEach(p => {
     const isAll  = p.classList.contains('all-pill');
     const active = isAll ? term === '' : p.textContent === term;
@@ -593,7 +669,8 @@ async function loadLibrary() {
   const limit = document.getElementById('lib-limit').value;
   const url   = `/api/torrents?q=${encodeURIComponent(q)}&sort=${sort}` +
                 `&limit=${limit}&offset=${libOffset}` +
-                (activeTerm ? `&term=${encodeURIComponent(activeTerm)}` : '');
+                (activeTerm     ? `&term=${encodeURIComponent(activeTerm)}`         : '') +
+                (activeCategory ? `&category=${encodeURIComponent(activeCategory)}` : '');
 
   document.getElementById('lib-table-wrap').innerHTML =
     '<p class="loading">Loading…</p>';
@@ -626,16 +703,9 @@ async function loadLibrary() {
         ? `<span class="multi" title="${sites}">×${r.sites.length}</span>` : '';
       const lastSeen = r.last_seen ? r.last_seen.slice(0,10) : '—';
       html += `<tr>
-        <td><button class="mag-btn" title="Open in Transmission"
-            onclick="fireMagnet('${escHtml(r.magnet)}')">🧲</button></td>
-        <td>
-          <a href="https://www.google.com/search?q=${encodeURIComponent(r.title)}&tbm=isch"
-             target="_blank" rel="noopener"
-             data-preview-title="${escHtml(r.title)}">
-            ${escHtml(r.title)}${multiTag}</a>
-          <a href="#" onclick="showDetail('${r.info_hash}');return false;"
-             title="Show details" style="margin-left:0.4rem;font-size:0.75rem;color:#666">ℹ</a>
-        </td>
+        <td><a class="mag-btn" href="${escHtml(r.magnet)}" title="Open magnet link">🧲</a></td>
+        <td><a href="#" onclick="showDetail('${r.info_hash}');return false;">
+            ${escHtml(r.title)}${multiTag}</a></td>
         <td>${escHtml(r.size || '?')}</td>
         <td class="seeds">${r.best_seeds}</td>
         <td class="leeches">${r.best_leeches}</td>
@@ -718,7 +788,7 @@ async function showRunDetail(searchId) {
     s.results.forEach(r => {
       const sites = (r.sites || []).join(', ');
       html += `<div class="appear-item">
-        <button class="mag-btn" onclick="fireMagnet('${escHtml(r.magnet)}')">🧲</button>
+        <a class="mag-btn" href="${escHtml(r.magnet)}" title="Open magnet link">🧲</a>
         &nbsp;<strong>${escHtml(r.title)}</strong><br>
         <span style="color:#888;font-size:0.75rem">
           ${escHtml(r.size||'?')} · <span class="seeds">${r.best_seeds}S</span>
@@ -760,8 +830,8 @@ async function showDetail(hash) {
         <div class="detail-label">Last seen</div>
         ${t.last_seen.slice(0,16).replace('T',' ')}</div>
       <div style="margin:1rem 0">
-        <button class="mag-btn" style="font-size:1.4rem"
-                onclick="fireMagnet('${escHtml(t.magnet)}')">🧲</button>
+        <a class="mag-btn" style="font-size:1.4rem" href="${escHtml(t.magnet)}"
+           title="Open magnet link">🧲</a>
         &nbsp;Open in Transmission
       </div>
       <hr style="border-color:#333;margin:1rem 0">
@@ -831,13 +901,19 @@ async function executePurge() {
     closePurge();
 
     // Reset all UI state
-    activeTerm  = '';
-    libOffset   = 0;
+    activeTerm     = '';
+    activeCategory = '';
+    libOffset      = 0;
 
     // Clear term pills back to just "All"
-    const bar = document.getElementById('term-bar');
-    bar.innerHTML = '<span class="term-label">Filter by term:</span>' +
+    const tbar = document.getElementById('term-bar');
+    tbar.innerHTML = '<span class="term-label">Term:</span>' +
       '<span class="term-pill all-pill active" onclick="setTerm(\'\')">All</span>';
+
+    // Clear category pills back to just "All"
+    const cbar = document.getElementById('cat-bar');
+    cbar.innerHTML = '<span class="filter-label">Category:</span>' +
+      '<span class="cat-pill active" onclick="setCategory(\'\')">All</span>';
 
     // Reload everything
     await loadStats();
@@ -856,98 +932,9 @@ document.getElementById('purge-overlay').addEventListener('click', function(e) {
   if (e.target === this) closePurge();
 });
 
-// ── Image hover preview ───────────────────────────────────────────────────
-const imgTooltip   = document.getElementById('img-tooltip');
-let   tipTimer     = null;
-let   tipHideTimer = null;
-let   tipCache     = {};   // title → urls[]
-
-function positionTip(mouseX, mouseY) {
-  const pad = 14;
-  const tw  = imgTooltip.offsetWidth  || 340;
-  const th  = imgTooltip.offsetHeight || 160;
-  let   x   = mouseX + pad;
-  let   y   = mouseY + pad;
-  if (x + tw > window.innerWidth  - 8) x = mouseX - tw - pad;
-  if (y + th > window.innerHeight - 8) y = mouseY - th - pad;
-  imgTooltip.style.left = x + 'px';
-  imgTooltip.style.top  = y + 'px';
-}
-
-function showImgTooltip(title, mouseX, mouseY) {
-  clearTimeout(tipHideTimer);
-  clearTimeout(tipTimer);
-
-  // Show spinner immediately
-  imgTooltip.innerHTML =
-    `<span class="tip-label">${escHtml(title)}</span>` +
-    `<span class="tip-spinner">Loading images…</span>`;
-  imgTooltip.classList.add('visible');
-  positionTip(mouseX, mouseY);
-
-  // Use cache if available
-  if (tipCache[title]) {
-    renderTip(title, tipCache[title]);
-    return;
-  }
-
-  tipTimer = setTimeout(async () => {
-    try {
-      const data = await apiFetch(
-        '/api/image-preview?title=' + encodeURIComponent(title));
-      tipCache[title] = data.urls || [];
-      renderTip(title, tipCache[title]);
-    } catch(e) {
-      renderTip(title, []);
-    }
-  }, 120);
-}
-
-function renderTip(title, urls) {
-  if (!imgTooltip.classList.contains('visible')) return;
-  if (!urls.length) {
-    imgTooltip.innerHTML =
-      `<span class="tip-label">${escHtml(title)}</span>` +
-      `<span class="tip-none">No images found</span>`;
-    return;
-  }
-  let html = `<span class="tip-label">${escHtml(title)}</span>`;
-  urls.forEach(u => {
-    html += `<img src="${escHtml(u)}" alt="" loading="lazy"
-                  onerror="this.style.display='none'">`;
-  });
-  imgTooltip.innerHTML = html;
-}
-
-function hideImgTooltip() {
-  clearTimeout(tipTimer);
-  tipHideTimer = setTimeout(() => {
-    imgTooltip.classList.remove('visible');
-    imgTooltip.innerHTML = '';
-  }, 200);
-}
-
-// Delegate hover events on title links inside the library table
-document.getElementById('lib-table-wrap').addEventListener('mouseover', e => {
-  const a = e.target.closest('a[data-preview-title]');
-  if (!a) return;
-  showImgTooltip(a.dataset.previewTitle, e.clientX, e.clientY);
-});
-
-document.getElementById('lib-table-wrap').addEventListener('mousemove', e => {
-  if (!imgTooltip.classList.contains('visible')) return;
-  const a = e.target.closest('a[data-preview-title]');
-  if (a) positionTip(e.clientX, e.clientY);
-});
-
-document.getElementById('lib-table-wrap').addEventListener('mouseout', e => {
-  const a = e.target.closest('a[data-preview-title]');
-  if (a) hideImgTooltip();
-});
-
 // ── Boot ───────────────────────────────────────────────────────────────────
 loadStats();
-loadTerms();
+loadCategories();
 loadLibrary();
 </script>
 </body>
@@ -1023,20 +1010,25 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/api/stats':
                 self._send_json(api_stats(conn))
 
-            # ── API: search terms list ────────────────────────────────────
+            # ── API: categories ───────────────────────────────────────────
+            elif path == '/api/categories':
+                self._send_json(api_categories(conn))
+
+            # ── API: search terms list (optional ?category= filter) ───────
             elif path == '/api/terms':
-                self._send_json(api_terms(conn))
+                self._send_json(api_terms(conn, category=qs1('category')))
 
             # ── API: torrents list ────────────────────────────────────────
             elif path == '/api/torrents':
                 rows = api_torrents(
                     conn,
-                    q      = qs1('q'),
-                    sort   = qs1('sort', 'best_seeds'),
-                    order  = qs1('order', 'desc'),
-                    limit  = int(qs1('limit', '200')),
-                    offset = int(qs1('offset', '0')),
-                    term   = qs1('term'),
+                    q        = qs1('q'),
+                    sort     = qs1('sort', 'best_seeds'),
+                    order    = qs1('order', 'desc'),
+                    limit    = int(qs1('limit', '200')),
+                    offset   = int(qs1('offset', '0')),
+                    term     = qs1('term'),
+                    category = qs1('category'),
                 )
                 self._send_json(rows)
 
@@ -1061,19 +1053,6 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(s)
                 else:
                     self._send_404()
-
-            # ── API: image preview proxy ──────────────────────────────────
-            elif path == '/api/image-preview':
-                title = qs1('title')
-                if not title:
-                    self._send_json({'error': 'missing title'}, 400)
-                else:
-                    try:
-                        urls = api_image_preview(title)
-                        self._send_json({'urls': urls})
-                    except Exception as e:
-                        print(f'[WARN] image-preview fetch failed: {e}', file=sys.stderr)
-                        self._send_json({'urls': []})
 
             else:
                 self._send_404()
