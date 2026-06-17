@@ -29,6 +29,7 @@ import os
 import json
 import sqlite3
 import argparse
+import subprocess
 import webbrowser
 import configparser
 from pathlib import Path
@@ -68,9 +69,29 @@ def _cfg_int(section, key, fallback):
     except (configparser.NoSectionError, configparser.NoOptionError, ValueError):
         return fallback
 
-DEFAULT_DB   = _cfg_get('paths', 'db_file',
+DEFAULT_DB           = _cfg_get('paths', 'db_file',
     str(Path.home() / 'Documents/Development/magnet_library.db'))
-DEFAULT_PORT = _cfg_int('server', 'port', 8080)
+DEFAULT_PORT         = _cfg_int('server', 'port', 8080)
+DEFAULT_TR_HOST      = _cfg_get('transmission', 'host', 'localhost:9091')
+DEFAULT_DOWNLOAD_DIR = _cfg_get('transmission', 'default_dir', str(Path.home() / 'Movies'))
+
+# Build category→download_dir map from [transmission] section.
+# Reserved keys that are not category names:
+_TR_RESERVED = {'host', 'default_dir', 'download_dir'}
+
+def _load_category_dirs() -> dict[str, str]:
+    """Return {category_lower: expanded_path} from [transmission] section."""
+    result: dict[str, str] = {}
+    try:
+        for key, val in _cfg.items('transmission'):
+            if key in _TR_RESERVED:
+                continue
+            result[key.lower()] = os.path.expanduser(val)
+    except configparser.NoSectionError:
+        pass
+    return result
+
+CATEGORY_DIRS: dict[str, str] = _load_category_dirs()
 
 # ══════════════════════════════════════════════════════════════════════════
 # Database helpers
@@ -390,7 +411,31 @@ def api_analyze(conn, search_id: int = 0) -> dict:
         'by_term':     by_term,
         'seed_dist':   buckets,
         'word_cloud':  word_freq,
+        'rows':        rows,
     }
+
+
+def api_transmission_add(magnet: str, tr_host: str, download_dir: str,
+                         category: str = '') -> dict:
+    """Send a single magnet to Transmission, routing to a category dir if configured."""
+    if not magnet.startswith('magnet:'):
+        return {'ok': False, 'error': 'Invalid magnet URI'}
+    # Category dir takes priority over the passed-in default
+    dest = CATEGORY_DIRS.get(category.lower()) if category else None
+    dest = os.path.expanduser(dest or download_dir)
+    try:
+        result = subprocess.run(
+            ['transmission-remote', tr_host,
+             '--download-dir', dest, '--add', magnet],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            return {'ok': True, 'output': result.stdout.strip(), 'download_dir': dest}
+        return {'ok': False, 'error': result.stderr.strip() or result.stdout.strip()}
+    except FileNotFoundError:
+        return {'ok': False, 'error': 'transmission-remote not found'}
+    except subprocess.TimeoutExpired:
+        return {'ok': False, 'error': 'transmission-remote timed out'}
 
 
 def api_searches(conn) -> list[dict]:
@@ -608,9 +653,18 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .word-cloud { display: flex; flex-wrap: wrap; gap: 0.4rem;
                 align-items: baseline; line-height: 1.6;
                 padding: 0.4rem 0; }
-  .wc-word { cursor: default; border-radius: 3px; padding: 0.1rem 0.35rem;
-             transition: filter 0.15s; white-space: nowrap; }
-  .wc-word:hover { filter: brightness(1.35); }
+  .wc-word { cursor: pointer; border-radius: 3px; padding: 0.1rem 0.35rem;
+             transition: filter 0.15s, box-shadow 0.15s; white-space: nowrap; }
+  .wc-word:hover  { filter: brightness(1.35); }
+  .wc-word.active { box-shadow: 0 0 0 2px #fff; filter: brightness(1.5); }
+
+  /* word drill results */
+  #wc-drill { margin-top: 1rem; border-top: 1px solid #333; padding-top: 0.8rem; }
+  #wc-drill h4 { margin: 0 0 0.6rem; color: #f90; font-size: 0.82rem;
+                 text-transform: uppercase; letter-spacing: 0.05em; }
+  #wc-drill table { font-size: 0.82rem; }
+  #wc-drill th { font-size: 0.78rem; padding: 5px 8px; }
+  #wc-drill td { padding: 4px 8px; }
 
   /* ── Purge confirm overlay ── */
   #purge-overlay { display: none; position: fixed; inset: 0;
@@ -874,7 +928,8 @@ async function loadLibrary() {
 
     let html = `<table>
       <thead><tr>
-        <th>🧲</th>
+        <th title="Send to Transmission">🧲</th>
+        <th title="Open in browser torrent client">🔗</th>
         <th onclick="setSortAndLoad('title')">Title</th>
         <th onclick="setSortAndLoad('size')">Size</th>
         <th onclick="setSortAndLoad('best_seeds')">Seeds</th>
@@ -890,7 +945,10 @@ async function loadLibrary() {
         ? `<span class="multi" title="${sites}">×${r.sites.length}</span>` : '';
       const lastSeen = r.last_seen ? r.last_seen.slice(0,10) : '—';
       html += `<tr>
-        <td><a class="mag-btn" href="${escHtml(r.magnet)}" title="Open magnet link">🧲</a></td>
+        <td><button class="mag-btn" title="Send to Transmission"
+              onclick="fireMagnet(this,'${escHtml(r.magnet)}')">🧲</button></td>
+        <td><a class="mag-btn" href="${escHtml(r.magnet)}"
+              title="Open magnet link in browser">🔗</a></td>
         <td>
           <a href="https://www.google.com/search?tbm=isch&q=${encodeURIComponent(r.title)}"
              target="_blank" title="Search Google Images for "${escHtml(r.title)}"">
@@ -929,6 +987,62 @@ function setSortAndLoad(col) {
   loadLibrary();
 }
 
+// ── Analyze word drill ────────────────────────────────────────────────────
+let analyzeRows = [];   // raw result rows for the current analyze run
+
+function showWordDrill(word) {
+  // Toggle: clicking the same word again clears the drill
+  const allWords = document.querySelectorAll('.wc-word');
+  const wasActive = [...allWords].some(
+    el => el.dataset.word === word && el.classList.contains('active')
+  );
+  allWords.forEach(el => el.classList.remove('active'));
+
+  const drill = document.getElementById('wc-drill');
+  if (wasActive) { drill.innerHTML = ''; return; }
+
+  // Mark active
+  allWords.forEach(el => {
+    if (el.dataset.word === word) el.classList.add('active');
+  });
+
+  const re = new RegExp('\\b' + word + '\\b', 'i');
+  const matches = analyzeRows
+    .filter(r => re.test(r.title))
+    .sort((a, b) => b.best_seeds - a.best_seeds);
+
+  if (!matches.length) {
+    drill.innerHTML = `<h4>"${escHtml(word)}" — no matches</h4>`;
+    return;
+  }
+
+  let html = `<h4>"${escHtml(word)}" — ${matches.length} torrent(s)</h4>
+    <table>
+      <thead><tr>
+        <th>🧲</th><th>🔗</th><th>Title</th><th>Size</th>
+        <th>Seeds</th><th>Site</th>
+      </tr></thead><tbody>`;
+
+  matches.forEach(r => {
+    const sites = (r.sites || []).join(', ');
+    const safeMagnet = escHtml(r.magnet);
+    html += `<tr>
+      <td><button class="mag-btn" title="Send to Transmission"
+            onclick="fireMagnet(this,'${safeMagnet}')">🧲</button></td>
+      <td><a class="mag-btn" href="${safeMagnet}" title="Open magnet link in browser">🔗</a></td>
+      <td><a href="https://www.google.com/search?tbm=isch&q=${encodeURIComponent(r.title)}"
+             target="_blank">${escHtml(r.title)}</a></td>
+      <td>${escHtml(r.size || '?')}</td>
+      <td class="seeds">${r.best_seeds}</td>
+      <td class="sites">${escHtml(sites)}</td>
+    </tr>`;
+  });
+
+  html += '</tbody></table>';
+  drill.innerHTML = html;
+  drill.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
 // ── Analyze ────────────────────────────────────────────────────────────────
 async function populateRunSelector() {
   try {
@@ -963,6 +1077,7 @@ function renderAnalyze(d) {
       '<p class="empty">No scrape runs found. Run magnetlookup.py first.</p>';
     return;
   }
+  analyzeRows = d.rows || [];
   const r   = d.run;
   const dt  = r.run_at.slice(0,16).replace('T',' ');
   const mode = r.js_mode ? ' · JS mode' : '';
@@ -1019,8 +1134,10 @@ function renderAnalyze(d) {
         const col = `rgb(${r_},${g_},${b_})`;
         const bg  = `rgba(${r_},${g_},${b_},0.10)`;
         return `<span class="wc-word"
+          data-word="${escHtml(w.word)}"
+          onclick="showWordDrill('${escHtml(w.word)}')"
           style="font-size:${em}rem;color:${col};background:${bg};border:1px solid rgba(${r_},${g_},${b_},0.25)"
-          title="${escHtml(w.word)}: ${w.count} titles · avg ${w.avg_seeds} seeds">${escHtml(w.word)}</span>`;
+          title="${escHtml(w.word)}: ${w.count} titles · avg ${w.avg_seeds} seeds — click to drill">${escHtml(w.word)}</span>`;
       }).join('') + '</div>';
   }
 
@@ -1070,6 +1187,7 @@ function renderAnalyze(d) {
         </span>
       </h3>
       ${cloudHtml}
+      <div id="wc-drill"></div>
     </div>`;
 }
 
@@ -1124,7 +1242,10 @@ async function showRunDetail(searchId) {
     s.results.forEach(r => {
       const sites = (r.sites || []).join(', ');
       html += `<div class="appear-item">
-        <a class="mag-btn" href="${escHtml(r.magnet)}" title="Open magnet link">🧲</a>
+        <button class="mag-btn" title="Send to Transmission"
+          onclick="fireMagnet(this,'${escHtml(r.magnet)}')">🧲</button>
+        <a class="mag-btn" href="${escHtml(r.magnet)}"
+          title="Open magnet link in browser">🔗</a>
         &nbsp;<strong>${escHtml(r.title)}</strong><br>
         <span style="color:#888;font-size:0.75rem">
           ${escHtml(r.size||'?')} · <span class="seeds">${r.best_seeds}S</span>
@@ -1165,10 +1286,18 @@ async function showDetail(hash) {
       <div class="detail-row">
         <div class="detail-label">Last seen</div>
         ${t.last_seen.slice(0,16).replace('T',' ')}</div>
-      <div style="margin:1rem 0">
-        <a class="mag-btn" style="font-size:1.4rem" href="${escHtml(t.magnet)}"
-           title="Open magnet link">🧲</a>
-        &nbsp;Open in Transmission
+      <div style="margin:1rem 0;display:flex;align-items:center;gap:1rem">
+        <span>
+          <button class="mag-btn" style="font-size:1.4rem"
+            title="Send to Transmission"
+            onclick="fireMagnet(this,'${escHtml(t.magnet)}')">🧲</button>
+          &nbsp;Transmission
+        </span>
+        <span>
+          <a class="mag-btn" style="font-size:1.4rem" href="${escHtml(t.magnet)}"
+            title="Open magnet link in browser">🔗</a>
+          &nbsp;Browser
+        </span>
       </div>
       <hr style="border-color:#333;margin:1rem 0">
       <div class="detail-label" style="margin-bottom:0.5rem">
@@ -1199,14 +1328,32 @@ function closeDetail() {
   document.getElementById('detail-panel').classList.remove('open');
 }
 
-// ── Magnet launcher ────────────────────────────────────────────────────────
-function fireMagnet(uri) {
-  const a = document.createElement('a');
-  a.href  = uri;
-  a.style.display = 'none';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
+// ── Magnet launcher — sends server-side to Transmission ───────────────────
+async function sendToTransmission(magnet, labelEl) {
+  const orig = labelEl ? labelEl.textContent : null;
+  if (labelEl) labelEl.textContent = '⏳';
+  try {
+    const r = await fetch('/api/transmission/add', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ magnet }),
+    });
+    const d = await r.json();
+    if (d.ok) {
+      const dir = d.download_dir ? ` → ${d.download_dir}` : '';
+      if (labelEl) { labelEl.title = 'Sent' + dir; labelEl.textContent = '✓'; setTimeout(() => { labelEl.textContent = orig; labelEl.title = 'Send to Transmission'; }, 2500); }
+    } else {
+      alert('Transmission error: ' + (d.error || 'unknown'));
+      if (labelEl) labelEl.textContent = orig;
+    }
+  } catch(e) {
+    alert('Request failed: ' + e.message);
+    if (labelEl) labelEl.textContent = orig;
+  }
+}
+
+function fireMagnet(btn, magnet) {
+  sendToTransmission(magnet, btn);
 }
 
 // ── Utility ────────────────────────────────────────────────────────────────
@@ -1284,7 +1431,9 @@ populateRunSelector();
 
 class Handler(BaseHTTPRequestHandler):
 
-    db_path: str = DEFAULT_DB
+    db_path:      str = DEFAULT_DB
+    tr_host:      str = DEFAULT_TR_HOST
+    download_dir: str = DEFAULT_DOWNLOAD_DIR
 
     def log_message(self, fmt, *args):
         # Suppress default per-request logging; uncomment to re-enable
@@ -1311,6 +1460,42 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_404(self):
         self._send_json({'error': 'Not found'}, 404)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path   = parsed.path.rstrip('/')
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            body   = json.loads(self.rfile.read(length) or b'{}')
+            if path == '/api/transmission/add':
+                magnet   = body.get('magnet', '')
+                category = body.get('category', '')
+                # If no category provided by the client, look it up from the DB
+                if not category and magnet.startswith('magnet:'):
+                    import re as _re
+                    m = _re.search(r'xt=urn:btih:([a-fA-F0-9]{40}|[A-Z2-7]{32})', magnet)
+                    if m:
+                        ih  = m.group(1).upper()
+                        conn = self._conn()
+                        row  = query_one(conn,
+                            "SELECT st.category FROM search_results sr "
+                            "JOIN search_terms st ON st.term = sr.search_term "
+                            "WHERE sr.info_hash = ? LIMIT 1", (ih,))
+                        conn.close()
+                        category = row['category'] if row else ''
+                result = api_transmission_add(
+                    magnet,
+                    tr_host=self.tr_host,
+                    download_dir=self.download_dir,
+                    category=category,
+                )
+                status = 200 if result['ok'] else 502
+                self._send_json(result, status)
+            else:
+                self._send_404()
+        except Exception as e:
+            self._send_json({'error': str(e)}, 500)
+            print(f'[ERROR] POST {path}: {e}', file=sys.stderr)
 
     def do_DELETE(self):
         parsed = urlparse(self.path)
@@ -1418,6 +1603,10 @@ def parse_args():
                    help=f'SQLite database path (default: {DEFAULT_DB})')
     p.add_argument('--no-browser', action='store_true',
                    help='Do not open browser on startup')
+    p.add_argument('--transmission-host', default=DEFAULT_TR_HOST, metavar='HOST:PORT',
+                   help=f'transmission-remote host (default: {DEFAULT_TR_HOST})')
+    p.add_argument('--download-dir', default=DEFAULT_DOWNLOAD_DIR, metavar='PATH',
+                   help=f'Transmission download directory (default: {DEFAULT_DOWNLOAD_DIR})')
     return p.parse_args()
 
 
@@ -1428,7 +1617,9 @@ def main():
         print(f'[WARN] Database not found: {args.db}')
         print('       Run magnetlookup.py at least once to create it.')
 
-    Handler.db_path = args.db
+    Handler.db_path      = args.db
+    Handler.tr_host      = args.transmission_host
+    Handler.download_dir = args.download_dir
     server = HTTPServer(('127.0.0.1', args.port), Handler)
 
     url = f'http://localhost:{args.port}'

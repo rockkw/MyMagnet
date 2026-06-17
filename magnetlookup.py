@@ -56,6 +56,7 @@ import csv
 import re
 import time
 import argparse
+import subprocess
 import webbrowser
 import sqlite3
 import logging
@@ -1306,7 +1307,45 @@ def parse_args():
         help='Cron/headless mode: implies --no-browser, enables file logging '
              f'to {DEFAULT_LOG_DIR}, exits with code 1 on any scrape error'
     )
+    p.add_argument(
+        '--send-to-transmission', action='store_true',
+        help='Send magnet links via transmission-remote to localhost:9091 '
+             'instead of opening them in the browser'
+    )
+    p.add_argument(
+        '--download-dir', metavar='PATH', default='~/Movies',
+        help='Download directory passed to Transmission (default: ~/Movies). '
+             'Only used with --send-to-transmission.'
+    )
     return p.parse_args()
+
+# ══════════════════════════════════════════════════════════════════════════
+# Transmission
+# ══════════════════════════════════════════════════════════════════════════
+
+def send_to_transmission(magnets: list[str], download_dir: str):
+    """Send each magnet to Transmission via transmission-remote."""
+    dest = os.path.expanduser(download_dir)
+    ok = fail = 0
+    for magnet in magnets:
+        try:
+            result = subprocess.run(
+                ['transmission-remote', 'localhost:9091',
+                 '--download-dir', dest, '--add', magnet],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                log.info(f'[Transmission] Added: {extract_name(magnet)}')
+                ok += 1
+            else:
+                log.error(f'[Transmission] Failed ({result.returncode}): '
+                          f'{result.stderr.strip() or result.stdout.strip()}')
+                fail += 1
+        except FileNotFoundError:
+            log.error('[Transmission] transmission-remote not found — '
+                      'install it with: brew install transmission-cli')
+            return
+    log.info(f'[Transmission] {ok} added, {fail} failed → {dest}')
 
 # ══════════════════════════════════════════════════════════════════════════
 # Main
@@ -1403,7 +1442,14 @@ def main():
     write_html(all_results, page_label, filename=ts_html, term_urls=term_urls)
     write_csv(all_results, ts_csv)
 
-    if not no_browser and all_results:
+    if args.send_to_transmission:
+        deduped_top, _ = deduplicate(all_results)
+        magnets = [r['magnet'] for r in deduped_top if seeded(r)]
+        if magnets:
+            send_to_transmission(magnets, args.download_dir)
+        else:
+            log.warning('No seeded magnets to send to Transmission.')
+    elif not no_browser and all_results:
         webbrowser.open(f'file://{os.path.abspath(ts_html)}')
 
     if args.cron and had_error:
