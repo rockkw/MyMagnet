@@ -431,6 +431,8 @@ def fetch_static(url: str, js_mode: bool = False) -> str | None:
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
+        if resp.encoding is None or resp.encoding.lower() == 'iso-8859-1':
+            resp.encoding = resp.apparent_encoding
         html = resp.text
         # Detect JS-wall responses and warn the user
         if not js_mode:
