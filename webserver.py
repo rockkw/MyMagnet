@@ -74,6 +74,7 @@ DEFAULT_DB           = _cfg_get('paths', 'db_file',
 DEFAULT_PORT         = _cfg_int('server', 'port', 8080)
 DEFAULT_TR_HOST      = _cfg_get('transmission', 'host', 'localhost:9091')
 DEFAULT_DOWNLOAD_DIR = _cfg_get('transmission', 'default_dir', str(Path.home() / 'Movies'))
+SEARCH_URL           = _cfg_get('search', 'search_url', '')
 
 # Build category→download_dir map from [transmission] section.
 # Reserved keys that are not category names:
@@ -598,6 +599,10 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .term-pill.all-pill { border-color: #666; }
   .term-pill.all-pill.active { background: #555; color: #eee;
                                 border-color: #888; }
+  .term-group { display: flex; align-items: center; gap: 0.15rem; }
+  .term-search-icon { cursor: pointer; font-size: 0.78rem; opacity: 0.7;
+                       transition: opacity 0.15s, transform 0.15s; }
+  .term-search-icon:hover { opacity: 1; transform: scale(1.15); }
 
   /* ── Pagination ── */
   .pagination { display: flex; gap: 0.5rem; margin-top: 1rem;
@@ -784,6 +789,23 @@ let libTotal       = 0;
 let searchTimer    = null;
 let activeTerm     = '';   // currently selected search term ('' = all)
 let activeCategory = '';   // currently selected category   ('' = all)
+let searchUrl      = '';   // search_url template from config.ini ([search])
+
+// ── Config ───────────────────────────────────────────────────────────────
+async function loadConfig() {
+  try {
+    const c = await apiFetch('/api/config');
+    searchUrl = c.search_url || '';
+  } catch(e) { console.warn('Config load failed', e); }
+}
+
+function buildSearchUrl(term) {
+  const encoded = encodeURIComponent(term);
+  if (!searchUrl) return null;
+  return searchUrl.includes('{term}')
+    ? searchUrl.replace('{term}', encoded)
+    : searchUrl + encoded;
+}
 
 // ── Page switching ─────────────────────────────────────────────────────────
 function showPage(name, el) {
@@ -876,19 +898,34 @@ async function loadTerms(categoryFilter = '') {
     const terms = await apiFetch(url);
     const bar   = document.getElementById('term-bar');
 
-    // Rebuild — keep only the "All" pill then append fresh pills
-    Array.from(bar.querySelectorAll('.term-pill:not(.all-pill)'))
+    // Rebuild — keep only the "All" pill then append fresh pill groups
+    Array.from(bar.querySelectorAll('.term-group'))
          .forEach(p => p.remove());
     // Reset All pill to active since we cleared activeTerm
     bar.querySelector('.all-pill').classList.add('active');
 
     terms.forEach(t => {
+      const group = document.createElement('span');
+      group.className = 'term-group';
+
       const pill = document.createElement('span');
       pill.className   = 'term-pill';
       pill.textContent = t.term;
       pill.title       = `[${t.category}] · Used ${t.use_count}× · last: ${t.last_used.slice(0,10)}`;
       pill.onclick     = () => setTerm(t.term);
-      bar.appendChild(pill);
+      group.appendChild(pill);
+
+      const url = buildSearchUrl(t.term);
+      if (url) {
+        const glass = document.createElement('span');
+        glass.className = 'term-search-icon';
+        glass.textContent = '🔍';
+        glass.title = `Search for "${t.term}"`;
+        glass.onclick = (e) => { e.stopPropagation(); window.open(url, '_blank'); };
+        group.appendChild(glass);
+      }
+
+      bar.appendChild(group);
     });
   } catch(e) { console.warn('Terms load failed', e); }
 }
@@ -1416,6 +1453,7 @@ document.getElementById('purge-overlay').addEventListener('click', function(e) {
 });
 
 // ── Boot ───────────────────────────────────────────────────────────────────
+loadConfig();
 loadStats();
 loadCategories();
 loadLibrary();
@@ -1531,6 +1569,10 @@ class Handler(BaseHTTPRequestHandler):
             # ── API: stats ────────────────────────────────────────────────
             elif path == '/api/stats':
                 self._send_json(api_stats(conn))
+
+            # ── API: client config (search_url, etc.) ──────────────────────
+            elif path == '/api/config':
+                self._send_json({'search_url': SEARCH_URL})
 
             # ── API: categories ───────────────────────────────────────────
             elif path == '/api/categories':
