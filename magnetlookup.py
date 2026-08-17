@@ -443,7 +443,7 @@ def fetch_js(url: str, wait_selector: str | None = None,
 def fetch_static(url: str, js_mode: bool = False) -> str | None:
     """Fetch a URL with requests and return HTML, or None on failure."""
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp = requests.get(url, headers=HEADERS, timeout=(10, 15))
         resp.raise_for_status()
         if resp.encoding is None or resp.encoding.lower() == 'iso-8859-1':
             resp.encoding = resp.apparent_encoding
