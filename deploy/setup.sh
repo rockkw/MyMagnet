@@ -53,7 +53,7 @@ python3 -m venv "$VENV_DIR"
 # Core deps only — Selenium/webdriver-manager are skipped since the systemd
 # unit runs with --no-js. Add them (`pip install selenium webdriver-manager`
 # + a Chromium install) only if you point urls.txt at a JS-rendered site.
-"$VENV_DIR"/bin/pip install requests==2.31.0 beautifulsoup4==4.12.3 lxml==5.2.1
+"$VENV_DIR"/bin/pip install requests==2.31.0 beautifulsoup4==4.12.3 lxml==6.1.1
 
 echo "==> Seeding config.ini env-var overrides"
 mkdir -p /etc/magnetlookup
