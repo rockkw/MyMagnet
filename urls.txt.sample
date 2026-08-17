@@ -1,0 +1,30 @@
+# urls.txt — search-URL templates used by magnetlookup.py's scraper.
+#
+# One URL per line. inject_search_term() fills in the `q=` or `search=`
+# query parameter with each search term from search_term.txt — leave that
+# parameter present but empty (e.g. "q=" or "search=") as the placeholder.
+#
+# Copy this file to the path set by [paths] urls_file in config.ini
+# (default: ~/Documents/Development/urls.txt, or $MAGNET_URLS_FILE).
+#
+# ── Internet Archive ─────────────────────────────────────────────────────
+# API-driven (see scrape_archive_org() in magnetlookup.py) — no HTML
+# scraping, so this line is not sensitive to site layout changes.
+# Optional &mediatype= filters to one Internet Archive collection type:
+#   movies (film/video) | audio (music) | texts (books/docs) | software
+# Add one line per mediatype you want covered, or omit &mediatype= to
+# search everything.
+https://archive.org/advancedsearch.php?q=&mediatype=movies&rows=15&output=json&fl[]=identifier&fl[]=title&fl[]=mediatype
+https://archive.org/advancedsearch.php?q=&mediatype=audio&rows=15&output=json&fl[]=identifier&fl[]=title&fl[]=mediatype
+https://archive.org/advancedsearch.php?q=&mediatype=texts&rows=15&output=json&fl[]=identifier&fl[]=title&fl[]=mediatype
+https://archive.org/advancedsearch.php?q=&mediatype=software&rows=15&output=json&fl[]=identifier&fl[]=title&fl[]=mediatype
+
+# ── LinuxTracker ─────────────────────────────────────────────────────────
+# Legitimate Linux-distro/open-source-ISO tracker. Uses the 'linuxtracker'
+# entry in SITE_PROFILES (magnetlookup.py) — row/seed/leech selectors are
+# best-effort and unverified against live markup; verify after your first
+# run and adjust SITE_PROFILES['linuxtracker'] if 0 results come back or
+# seed/leech columns show '?' persistently. Magnet-link discovery itself
+# doesn't depend on those selectors being exactly right (see
+# fetch_detail_magnet's regex fallback), so this degrades safely.
+https://linuxtracker.org/index.php?page=torrents&search=

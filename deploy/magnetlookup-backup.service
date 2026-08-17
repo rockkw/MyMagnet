@@ -1,0 +1,10 @@
+[Unit]
+Description=Sync magnetlookup db/logs/results to S3
+After=magnetlookup.service
+
+[Service]
+Type=oneshot
+User=magnetlookup
+Group=magnetlookup
+EnvironmentFile=/etc/magnetlookup/env
+ExecStart=/opt/magnetlookup/app/deploy/backup_to_s3.sh

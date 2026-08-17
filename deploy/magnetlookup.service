@@ -1,0 +1,28 @@
+[Unit]
+Description=magnetlookup scrape run (archive.org + LinuxTracker)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=magnetlookup
+Group=magnetlookup
+WorkingDirectory=/opt/magnetlookup/app
+EnvironmentFile=/etc/magnetlookup/env
+ExecStart=/opt/magnetlookup/venv/bin/python3 magnetlookup.py --cron --no-browser --no-js
+# --no-js: neither archive.org (JSON API) nor linuxtracker.org (classic
+# server-rendered HTML) need headless Chrome, so this skips installing
+# Chromium/chromedriver on the instance entirely. If you add a JS-heavy
+# site later, drop --no-js here and run deploy/setup.sh's optional
+# Chromium install step.
+
+# Hardening — the process only needs to read/write its own data dir and
+# reach the network; lock everything else down.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/magnetlookup/data
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

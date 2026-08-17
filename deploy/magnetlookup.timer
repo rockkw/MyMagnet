@@ -1,0 +1,14 @@
+[Unit]
+Description=Run magnetlookup daily (replaces the old launchd 06:00 plist)
+
+[Timer]
+# Server clocks are UTC by default on EC2/Lightsail — adjust the hour if
+# you want this to line up with 06:00 in your local timezone, or set the
+# instance timezone with: sudo timedatectl set-timezone America/Los_Angeles
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+# Spread load a little if you ever run more than one instance/site.
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

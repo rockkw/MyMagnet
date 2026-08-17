@@ -63,6 +63,7 @@ def _get(section, key, fallback):
 DEFAULT_SEARCH_FILE = _get('paths', 'search_file',
     os.path.expanduser(
         '~/Library/Mobile Documents/com~apple~CloudDocs/Downloads/search_term.txt'))
+DEFAULT_SEARCH_FILE_2 = _get('paths', 'search_file_2', '')
 DEFAULT_DB_FILE = _get('paths', 'db_file',
     os.path.expanduser('~/Documents/Development/magnet_library.db'))
 DEFAULT_LOG_DIR = _get('paths', 'log_dir',
@@ -87,14 +88,17 @@ def stat_key(path: str):
     except OSError:
         return None
 
-def launch(search_file: str, db: str, extra_args: list[str], dry_run: bool):
+def launch(search_file: str, search_file_2: str, db: str, extra_args: list[str], dry_run: bool):
     cmd = [
         sys.executable, str(MAGNETLOOKUP),
         '--search-file', search_file,
         '--db', db,
         '--no-browser',
         '--cron',
-    ] + extra_args
+    ]
+    if search_file_2:
+        cmd += ['--search-file-2', search_file_2]
+    cmd += extra_args
 
     print(f'\n[watch_terms] Change detected — launching scrape')
     print(f'[watch_terms] Command: {" ".join(cmd)}\n')
@@ -115,13 +119,17 @@ def launch(search_file: str, db: str, extra_args: list[str], dry_run: bool):
     except Exception as e:
         print(f'[watch_terms] Failed to launch: {e}', file=sys.stderr)
 
-def watch(search_file: str, db: str, interval: float,
+def watch(search_file: str, search_file_2: str, db: str, interval: float,
           extra_args: list[str], dry_run: bool):
     print(f'[watch_terms] Watching: {search_file}')
+    if search_file_2:
+        print(f'[watch_terms] Watching: {search_file_2}')
     print(f'[watch_terms] Poll interval: {interval}s  |  Ctrl-C to stop\n')
 
     last_stat    = stat_key(search_file)
     last_content = read_terms(search_file)
+    last_stat_2    = stat_key(search_file_2) if search_file_2 else None
+    last_content_2 = read_terms(search_file_2) if search_file_2 else ''
 
     if last_stat is None:
         print(f'[watch_terms] File not found yet — will trigger when it appears.')
@@ -133,27 +141,34 @@ def watch(search_file: str, db: str, interval: float,
             print('\n[watch_terms] Stopped.')
             break
 
-        cur_stat = stat_key(search_file)
+        cur_stat   = stat_key(search_file)
+        cur_stat_2 = stat_key(search_file_2) if search_file_2 else None
 
-        # No change in mtime/size — skip the read
-        if cur_stat == last_stat:
+        # No change in mtime/size on either file — skip the reads
+        if cur_stat == last_stat and cur_stat_2 == last_stat_2:
             continue
 
-        cur_content = read_terms(search_file)
+        cur_content   = read_terms(search_file) if cur_stat != last_stat else last_content
+        cur_content_2 = (read_terms(search_file_2)
+                          if search_file_2 and cur_stat_2 != last_stat_2
+                          else last_content_2)
 
-        if cur_content != last_content:
-            last_stat    = cur_stat
-            last_content = cur_content
-            launch(search_file, db, extra_args, dry_run)
+        if cur_content != last_content or cur_content_2 != last_content_2:
+            last_stat, last_content     = cur_stat, cur_content
+            last_stat_2, last_content_2 = cur_stat_2, cur_content_2
+            launch(search_file, search_file_2, db, extra_args, dry_run)
         else:
-            # mtime changed but content identical (e.g. iCloud sync touch)
-            last_stat = cur_stat
+            # mtime changed but content identical (e.g. iCloud/Drive sync touch)
+            last_stat, last_stat_2 = cur_stat, cur_stat_2
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--search-file', default=DEFAULT_SEARCH_FILE, metavar='PATH',
         help=f'File to watch (default: {DEFAULT_SEARCH_FILE})')
+    p.add_argument('--search-file-2', default=DEFAULT_SEARCH_FILE_2, metavar='PATH',
+        help='2nd file to watch, e.g. Google Drive (default: '
+             f'{DEFAULT_SEARCH_FILE_2 or "(none)"})')
     p.add_argument('--db', default=DEFAULT_DB_FILE, metavar='PATH',
         help=f'Database path passed to magnetlookup.py (default: {DEFAULT_DB_FILE})')
     p.add_argument('--interval', type=float, default=3.0, metavar='SECS',
@@ -165,7 +180,7 @@ def main():
     args = p.parse_args()
 
     extra = ['--no-js'] if args.no_js else []
-    watch(args.search_file, args.db, args.interval, extra, args.dry_run)
+    watch(args.search_file, args.search_file_2, args.db, args.interval, extra, args.dry_run)
 
 if __name__ == '__main__':
     main()

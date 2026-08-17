@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the S3 backup shortly after the daily scrape finishes
+
+[Timer]
+# 30 min after the 06:00 scrape timer, so the run has finished before backup.
+OnCalendar=*-*-* 06:30:00
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

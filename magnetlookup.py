@@ -19,7 +19,7 @@ ONE-OFF SEARCHES:
 
     python3 magnetlookup.py --term "Polymer Materials"
     python3 magnetlookup.py --term "Polymer Materials" --category Books
-    python3 magnetlookup.py --url "https://thepiratebay.org/search.php?q=Polymer+Materials"
+    python3 magnetlookup.py --url "https://archive.org/advancedsearch.php?q=Polymer+Materials&mediatype=texts&output=json&fl[]=identifier&fl[]=title"
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -60,9 +60,10 @@ import subprocess
 import webbrowser
 import sqlite3
 import logging
+import hashlib
 import configparser as _cp
 from collections import OrderedDict, defaultdict
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, unquote_plus
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, unquote_plus, quote_plus
 from datetime import datetime
 from pathlib import Path
 
@@ -133,6 +134,7 @@ def _get(section, key, fallback):
 
 DEFAULT_SEARCH_FILE = _get('paths', 'search_file',
     os.path.expanduser('~/Library/Mobile Documents/com~apple~CloudDocs/Downloads/search_term.txt'))
+DEFAULT_SEARCH_FILE_2 = _get('paths', 'search_file_2', '')
 DEFAULT_URLS_FILE   = _get('paths', 'urls_file',
     os.path.expanduser('~/Documents/Development/urls.txt'))
 DEFAULT_DB_FILE     = _get('paths', 'db_file',
@@ -155,64 +157,39 @@ REQUEST_DELAY       = float(_get('scraper', 'request_delay',   '2'))
 #                             visit each detail page individually.
 
 SITE_PROFILES = {
-    'thepiratebay': {
-        # Verified March 2026 — TPB now uses <ol>/<li> layout
-        'row_selector':      'ol.view-single li.list-entry',
-        'title_selector':    '.item-name.item-title a',
-        'magnet_selector':   'a[href^="magnet:"]',
-        'seed_selector':     '.item-seed',
-        'leech_selector':    '.item-leech',
-        'size_regex':        r'([\d.]+\s*[KMGT]iB)',
-        'js_wait_selector':  'ol.view-single',
-    },
-    # 1337x and 1377x share identical DOM; 1377x is a common mirror
-    '1337x': {
-        # Verified March 2026 — magnets on detail pages only
-        'row_selector':      'table.table-list tbody tr',
-        'title_selector':    'td.name a:nth-of-type(2)',
+    # LinuxTracker — legitimate BitTorrent tracker for Linux distros / open-
+    # source ISOs. Legacy phpBB-style markup with no CSS classes on its
+    # tables, so rows are located structurally via the torrent-details link
+    # rather than by class name (soupsieve :has() support required — bundled
+    # with modern BeautifulSoup/lxml). seed/leech column positions are a
+    # best-effort guess (unverified against live markup from this sandbox —
+    # WebFetch only returns a summarized/markdown view, not raw HTML) and
+    # degrade harmlessly to '?' if wrong. Detail-page magnet extraction falls
+    # back to a whole-page regex scan (see fetch_detail_magnet), so magnet
+    # discovery itself does not depend on these guesses being right.
+    'linuxtracker': {
+        'row_selector':       'tr:has(a[href*="page=torrent-details"])',
+        'title_selector':     'a[href*="page=torrent-details"]',
         'detail_page_magnet': True,
-        'detail_base_url':   'https://www.1377x.to',
-        'magnet_selector':   'a[href^="magnet:"]',
-        'seed_selector':     'td.seeds',
-        'leech_selector':    'td.leeches',
-        'size_selector':     'td.size',
-        'js_wait_selector':  'table.table-list',
+        'detail_base_url':    'https://linuxtracker.org/',
+        'magnet_selector':    'a[href^="magnet:"]',
+        'seed_selector':      'td:nth-of-type(6)',   # unverified — adjust if wrong
+        'leech_selector':     'td:nth-of-type(7)',   # unverified — adjust if wrong
+        'size_regex':         r'([\d.]+\s*[KMGT]i?B)',
+        'js_wait_selector':   None,
     },
-    '1377x': {
-        'row_selector':      'table.table-list tbody tr',
-        'title_selector':    'td.name a:nth-of-type(2)',
-        'detail_page_magnet': True,
-        'detail_base_url':   'https://www.1377x.to',
-        'magnet_selector':   'a[href^="magnet:"]',
-        'seed_selector':     'td.seeds',
-        'leech_selector':    'td.leeches',
-        'size_selector':     'td.size',
-        'js_wait_selector':  'table.table-list',
-    },
-    # rarbg and rargb share identical DOM; rargb.to is a common mirror spelling
-    'rarbg': {
-        # Verified March 2026 — magnets on detail pages only
-        'row_selector':      'table.lista2t tr.lista2',
-        'title_selector':    'td:nth-of-type(2) a',
-        'detail_page_magnet': True,
-        'detail_base_url':   'https://rargb.to',
-        'magnet_selector':   'a[href^="magnet:"]',
-        'seed_selector':     'td:nth-of-type(6)',
-        'leech_selector':    'td:nth-of-type(7)',
-        'size_selector':     'td:nth-of-type(5)',
-        'js_wait_selector':  'table.lista2t',
-    },
-    'rargb': {
-        'row_selector':      'table.lista2t tr.lista2',
-        'title_selector':    'td:nth-of-type(2) a',
-        'detail_page_magnet': True,
-        'detail_base_url':   'https://rargb.to',
-        'magnet_selector':   'a[href^="magnet:"]',
-        'seed_selector':     'td:nth-of-type(6)',
-        'leech_selector':    'td:nth-of-type(7)',
-        'size_selector':     'td:nth-of-type(5)',
-        'js_wait_selector':  'table.lista2t',
-    },
+}
+
+# ── Archive.org — legitimate, API-driven (no HTML scraping) ────────────────
+# Internet Archive auto-generates a BitTorrent file for most items. There's
+# no magnet link published anywhere on the site, so one is built by
+# downloading that .torrent file and computing its BTIH (SHA1 of the raw
+# bencoded 'info' dict — see torrent_info_hash() below).
+ARCHIVE_ORG_MEDIATYPE_ALIASES = {
+    'movies': 'movies', 'movie': 'movies', 'video': 'movies',
+    'music': 'audio', 'audio': 'audio',
+    'books': 'texts', 'book': 'texts', 'texts': 'texts',
+    'software': 'software',
 }
 
 HEADERS = {
@@ -287,7 +264,12 @@ def check_dependencies(js_mode: bool = False):
 def inject_search_term(template_url: str, term: str) -> str:
     """Replace the search parameter in a URL template with the given term."""
     parsed = urlparse(template_url)
-    params = parse_qs(parsed.query)
+    # keep_blank_values=True: a template written as "...?q=" (empty placeholder,
+    # e.g. the archive.org advancedsearch.php template) must still be recognised
+    # as having a 'q' key — parse_qs() drops blank-valued keys by default, which
+    # would otherwise fall through to the 'else' branch and add a spurious
+    # second 'search=' param instead of filling in 'q'.
+    params = parse_qs(parsed.query, keep_blank_values=True)
 
     if 'q' in params:
         params['q'] = [term]
@@ -320,29 +302,8 @@ def build_search_urls(term: str, urls_file: str) -> list[str]:
 def normalise_category(raw: str) -> str:
     return raw.strip().title()
 
-def read_search_terms(path: str) -> list[tuple[str, str]]:
-    """
-    Read search_term.txt and return list of (term, category) tuples.
-
-    File format:
-        [Music]             ← sets current category (title-cased on read)
-        Pink Floyd          ← ('Pink Floyd', 'Music')
-        Aphex Twin
-        # commented out     ← ignored
-        [Books]
-        Polymer Materials   ← ('Polymer Materials', 'Books')
-
-    Lines before any header get category 'Default'.
-    A file with no headers works unchanged — all terms get category 'Default'.
-    """
-    try:
-        with open(path, 'r') as f:
-            lines = f.readlines()
-    except FileNotFoundError:
-        print(f'[ERROR] Search term file not found: {path}')
-        print( '        Add terms (one per line) to that file, or use --term')
-        sys.exit(1)
-
+def _parse_search_term_lines(lines: list[str]) -> list[tuple[str, str]]:
+    """Parse search_term.txt-format lines into (term, category) tuples."""
     results: list[tuple[str, str]] = []
     current_category = 'Default'
 
@@ -355,15 +316,68 @@ def read_search_terms(path: str) -> list[tuple[str, str]]:
         else:
             results.append((line, current_category))
 
+    return results
+
+def read_search_terms(path: str, path_2: str = '') -> list[tuple[str, str]]:
+    """
+    Read search_term.txt (and optionally a 2nd search-term file, e.g. from
+    Google Drive) and return a combined, de-duplicated list of
+    (term, category) tuples.
+
+    File format:
+        [Music]             ← sets current category (title-cased on read)
+        Pink Floyd          ← ('Pink Floyd', 'Music')
+        Aphex Twin
+        # commented out     ← ignored
+        [Books]
+        Polymer Materials   ← ('Polymer Materials', 'Books')
+
+    Lines before any header get category 'Default'.
+    A file with no headers works unchanged — all terms get category 'Default'.
+
+    path_2 is optional; if blank or the file doesn't exist it's skipped
+    silently (only the primary path is required to exist).
+    """
+    try:
+        with open(path, 'r') as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        print(f'[ERROR] Search term file not found: {path}')
+        print( '        Add terms (one per line) to that file, or use --term')
+        sys.exit(1)
+
+    results = _parse_search_term_lines(lines)
+    sources = [path]
+
+    if path_2:
+        try:
+            with open(path_2, 'r') as f:
+                lines_2 = f.readlines()
+            results.extend(_parse_search_term_lines(lines_2))
+            sources.append(path_2)
+        except FileNotFoundError:
+            print(f'[WARN] 2nd search term file not found, skipping: {path_2}')
+
+    # De-dupe (term, category) pairs while preserving first-seen order —
+    # the same term can legitimately appear under different categories.
+    seen = set()
+    deduped: list[tuple[str, str]] = []
+    for term, cat in results:
+        key = (term, cat)
+        if key not in seen:
+            seen.add(key)
+            deduped.append((term, cat))
+    results = deduped
+
     if not results:
-        print(f'[ERROR] No search terms found in {path}')
+        print(f'[ERROR] No search terms found in {" or ".join(sources)}')
         sys.exit(1)
 
     by_cat: dict[str, list[str]] = defaultdict(list)
     for term, cat in results:
         by_cat[cat].append(term)
 
-    print(f'[INFO] {len(results)} search term(s) loaded from {path}')
+    print(f'[INFO] {len(results)} search term(s) loaded from {" + ".join(sources)}')
     for cat, terms in by_cat.items():
         print(f'         [{cat}]')
         for t in terms:
@@ -596,12 +610,158 @@ def parse_results(html: str, source_url: str,
 
     return results
 
+# ══════════════════════════════════════════════════════════════════════════
+# Archive.org — API + bencode, no HTML scraping
+# ══════════════════════════════════════════════════════════════════════════
+
+def _bencode_value_end(data: bytes, i: int) -> int:
+    """Return the index one past the bencoded value that starts at i."""
+    c = data[i:i + 1]
+    if c == b'i':
+        return data.index(b'e', i) + 1
+    if c == b'l' or c == b'd':
+        j = i + 1
+        while data[j:j + 1] != b'e':
+            j = _bencode_value_end(data, j)          # key (or list item)
+            if c == b'd':
+                j = _bencode_value_end(data, j)       # value, for dicts
+        return j + 1
+    if c.isdigit():
+        colon = data.index(b':', i)
+        length = int(data[i:colon])
+        return colon + 1 + length
+    raise ValueError(f'invalid bencode at offset {i}')
+
+def torrent_info_hash(torrent_bytes: bytes) -> str:
+    """
+    Parse a .torrent file's top-level dict just far enough to find the raw
+    byte span of its 'info' value, and SHA1-hash those exact bytes — that
+    hash is the BTIH used in magnet links (BEP 3). Re-encoding the decoded
+    dict instead of hashing the original bytes can produce a different
+    (wrong) hash if the source encoder ever deviates from canonical bencode,
+    so this hashes the untouched slice rather than round-tripping it.
+    """
+    if torrent_bytes[0:1] != b'd':
+        raise ValueError('not a bencoded dict')
+    i = 1
+    while torrent_bytes[i:i + 1] != b'e':
+        colon = torrent_bytes.index(b':', i)
+        klen  = int(torrent_bytes[i:colon])
+        kstart = colon + 1
+        key    = torrent_bytes[kstart:kstart + klen]
+        vstart = kstart + klen
+        vend   = _bencode_value_end(torrent_bytes, vstart)
+        if key == b'info':
+            return hashlib.sha1(torrent_bytes[vstart:vend]).hexdigest().upper()
+        i = vend
+    raise ValueError("no top-level 'info' key in torrent file")
+
+ARCHIVE_TRACKERS = [
+    'udp://tracker.opentrackr.org:1337/announce',
+    'udp://tracker.openbittorrent.com:6969/announce',
+]
+
+def scrape_archive_org(url: str, max_results: int = 15) -> list[dict]:
+    """
+    Handle an archive.org advancedsearch.php URL: run the search via the
+    JSON API, then for each hit fetch Internet Archive's auto-generated
+    <identifier>_archive.torrent and derive a magnet link from its BTIH.
+    No HTML scraping / CSS selectors involved, so this isn't sensitive to
+    site layout changes the way the SITE_PROFILES scrapers are.
+    """
+    parsed = urlparse(url)
+    q_params = parse_qs(parsed.query)
+    term      = (q_params.get('q') or [''])[0]
+    mediatype = (q_params.get('mediatype') or [''])[0].strip().lower()
+    mediatype = ARCHIVE_ORG_MEDIATYPE_ALIASES.get(mediatype, mediatype)
+    if not term:
+        print('  [WARN] archive.org URL has no q= search term — skipping')
+        return []
+
+    query = term if not mediatype else f'{term} AND mediatype:{mediatype}'
+    try:
+        resp = requests.get(
+            'https://archive.org/advancedsearch.php',
+            params={
+                'q': query,
+                'fl[]': ['identifier', 'title', 'mediatype'],
+                'rows': str(max_results),
+                'page': '1',
+                'output': 'json',
+            },
+            headers=HEADERS, timeout=20,
+        )
+        resp.raise_for_status()
+        docs = resp.json().get('response', {}).get('docs', [])
+    except Exception as e:
+        print(f'  [WARN] archive.org search failed: {e}')
+        return []
+
+    results = []
+    for doc in docs:
+        identifier = doc.get('identifier')
+        if not identifier:
+            continue
+        title = doc.get('title') or identifier
+        torrent_name = f'{identifier}_archive.torrent'
+
+        try:
+            meta = requests.get(f'https://archive.org/metadata/{identifier}',
+                                 headers=HEADERS, timeout=20).json()
+        except Exception as e:
+            print(f'  [WARN] archive.org metadata failed for {identifier}: {e}')
+            continue
+
+        files = meta.get('files', []) if isinstance(meta, dict) else []
+        file_entry = next((f for f in files if f.get('name') == torrent_name), None)
+        if not file_entry:
+            continue  # item has no auto-generated torrent (e.g. tiny items)
+
+        try:
+            tbytes = requests.get(f'https://archive.org/download/{identifier}/{torrent_name}',
+                                   headers=HEADERS, timeout=30).content
+            info_hash = torrent_info_hash(tbytes)
+        except Exception as e:
+            print(f'  [WARN] archive.org torrent parse failed for {identifier}: {e}')
+            continue
+
+        magnet = f'magnet:?xt=urn:btih:{info_hash}&dn={quote_plus(title)}'
+        for tr in ARCHIVE_TRACKERS:
+            magnet += f'&tr={quote_plus(tr)}'
+
+        size = file_entry.get('size', '?')
+        if isinstance(size, str) and size.isdigit():
+            n = int(size)
+            for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB'):
+                if n < 1024 or unit == 'TiB':
+                    size = f'{n:.2f} {unit}' if unit != 'B' else f'{n} B'
+                    break
+                n /= 1024
+
+        results.append({
+            'title':      title,
+            'magnet':     magnet,
+            'info_hash':  info_hash,
+            'seeds':      '?',      # archive.org doesn't expose swarm stats
+            'leeches':    '?',
+            'size':       size,
+            'source_url': f'https://archive.org/details/{identifier}',
+        })
+        time.sleep(REQUEST_DELAY)
+
+    print(f'  Found {len(results)} magnet(s)')
+    return results
+
 def scrape(url: str, js_mode: bool = False) -> list[dict]:
     """
     Fetch one search URL and return its results.
     In JS mode, creates ONE shared Chrome driver for the search page AND all
     subsequent detail page fetches — avoids launching Chrome once per row.
     """
+    if 'archive.org' in urlparse(url).netloc.lower():
+        print(f'  Fetching (API): {url}')
+        return scrape_archive_org(url)
+
     print(f'  Fetching ({"JS" if js_mode else "static"}): {url}')
     profile  = get_profile(url)
     wait_sel = profile.get('js_wait_selector') if profile else None
@@ -1270,6 +1430,13 @@ def parse_args():
         help=f'Path to search_term.txt (default: {DEFAULT_SEARCH_FILE})'
     )
     p.add_argument(
+        '--search-file-2', metavar='PATH',
+        default=DEFAULT_SEARCH_FILE_2,
+        help='Path to a 2nd search_term.txt (e.g. Google Drive) whose terms '
+             'are concatenated with --search-file before searching. '
+             f'Default from config.ini: {DEFAULT_SEARCH_FILE_2 or "(none)"}'
+    )
+    p.add_argument(
         '--urls-file', metavar='PATH',
         default=DEFAULT_URLS_FILE,
         help=f'Path to urls.txt (default: {DEFAULT_URLS_FILE})'
@@ -1380,7 +1547,7 @@ def main():
         urls = build_search_urls(args.term, args.urls_file)
         jobs = [(args.term, cat, urls)]
     else:
-        term_cats = read_search_terms(args.search_file)
+        term_cats = read_search_terms(args.search_file, args.search_file_2)
         for term, category in term_cats:
             urls = build_search_urls(term, args.urls_file)
             jobs.append((term, category, urls))

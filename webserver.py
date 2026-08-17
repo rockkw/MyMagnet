@@ -27,6 +27,7 @@ API (JSON):
 import sys
 import os
 import json
+import socket
 import sqlite3
 import argparse
 import subprocess
@@ -35,7 +36,10 @@ import configparser
 from pathlib import Path
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, quote
+import urllib.request
+import urllib.error
+import re as _re_top
 
 # ── Defaults (read from config.ini if present, else fall back) ───────────────
 def _load_config() -> configparser.ConfigParser:
@@ -75,6 +79,19 @@ DEFAULT_PORT         = _cfg_int('server', 'port', 8080)
 DEFAULT_TR_HOST      = _cfg_get('transmission', 'host', 'localhost:9091')
 DEFAULT_DOWNLOAD_DIR = _cfg_get('transmission', 'default_dir', str(Path.home() / 'Movies'))
 SEARCH_URL           = _cfg_get('search', 'search_url', '')
+
+def _load_search_sites() -> list[dict]:
+    """Return [{name, url}] from [search_sites] section, in file order."""
+    result: list[dict] = []
+    try:
+        for key, val in _cfg.items('search_sites'):
+            # configparser lowercases keys; title-case for display.
+            result.append({'name': key.title(), 'url': val})
+    except configparser.NoSectionError:
+        pass
+    return result
+
+SEARCH_SITES: list[dict] = _load_search_sites()
 
 # Build category→download_dir map from [transmission] section.
 # Reserved keys that are not category names:
@@ -439,6 +456,45 @@ def api_transmission_add(magnet: str, tr_host: str, download_dir: str,
         return {'ok': False, 'error': 'transmission-remote timed out'}
 
 
+_IMG_SEARCH_HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/123.0.0.0 Safari/537.36'
+    ),
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+_MURL_RE = _re_top.compile(r'murl&quot;:&quot;(https?://[^&]+?)&quot;')
+
+def api_image_search(term: str, limit: int = 12) -> dict:
+    """
+    Fetch Bing Images' static result HTML and pull out real photo URLs
+    (the `murl` field embedded in each result's JSON blob) for previewing.
+    No API key required; this reads only the static page markup.
+    """
+    if not term:
+        return {'images': []}
+    url = f'https://www.bing.com/images/search?q={quote(term)}&form=HDRSC2'
+    req = urllib.request.Request(url, headers=_IMG_SEARCH_HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            html = resp.read().decode('utf-8', errors='replace')
+    except (urllib.error.URLError, TimeoutError) as e:
+        return {'images': [], 'error': str(e)}
+
+    seen: set[str] = set()
+    images: list[str] = []
+    for m in _MURL_RE.finditer(html):
+        u = m.group(1)
+        if u in seen:
+            continue
+        seen.add(u)
+        images.append(u)
+        if len(images) >= limit:
+            break
+    return {'images': images}
+
+
 def api_searches(conn) -> list[dict]:
     return query(conn,
         "SELECT * FROM searches ORDER BY run_at DESC LIMIT 100")
@@ -583,6 +639,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .cat-pill:hover  { border-color: #f90; color: #f90; }
   .cat-pill.active { background: #f90; color: #111;
                      border-color: #f90; font-weight: 600; }
+  .cat-group { display: flex; align-items: center; gap: 0.15rem; }
 
   /* Term filter pills ── */
   .term-bar   { display: flex; flex-wrap: wrap; gap: 0.4rem;
@@ -604,6 +661,18 @@ PAGE_HTML = r"""<!DOCTYPE html>
                        transition: opacity 0.15s, transform 0.15s; }
   .term-search-icon:hover { opacity: 1; transform: scale(1.15); }
 
+  /* Compact mode — caps the term-bar height and scrolls instead of
+     wrapping indefinitely; default when many terms are loaded. */
+  .term-bar.compact { max-height: 5.5rem; overflow-y: auto;
+                       align-content: flex-start; padding-right: 0.3rem; }
+
+  /* ── Nav-bar layout toggle ── */
+  #nav-toggle-btn { cursor: pointer; background: #1a1a1a; color: #ccc;
+                     border: 1px solid #444; border-radius: 4px;
+                     padding: 0.3rem 0.7rem; font-size: 0.78rem;
+                     white-space: nowrap; }
+  #nav-toggle-btn:hover { border-color: #f90; color: #f90; }
+
   /* ── Pagination ── */
   .pagination { display: flex; gap: 0.5rem; margin-top: 1rem;
                align-items: center; font-size: 0.85rem; }
@@ -621,6 +690,23 @@ PAGE_HTML = r"""<!DOCTYPE html>
                transition: all 0.15s; white-space: nowrap; }
   #purge-btn:hover  { background: #c44; color: #fff; }
   #purge-btn:active { transform: scale(0.97); }
+
+  /* ── Multi-site search page ── */
+  .mss-grid { display: grid; gap: 1.2rem;
+              grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .mss-card { background: #1a1a1a; border: 1px solid #333; border-radius: 8px;
+              padding: 0.9rem 1.1rem; }
+  .mss-card h3 { margin: 0 0 0.6rem; font-size: 0.9rem; display: flex;
+                 align-items: center; justify-content: space-between; }
+  .mss-card h3 a { color: #f90; }
+  .mss-open { font-size: 0.72rem; color: #888; border: 1px solid #444;
+              border-radius: 4px; padding: 0.15rem 0.5rem; }
+  .mss-open:hover { border-color: #f90; color: #f90; }
+  .mss-imgs { display: grid; grid-template-columns: repeat(3, 1fr);
+              gap: 0.4rem; }
+  .mss-imgs img { width: 100%; height: 90px; object-fit: cover;
+                  border-radius: 4px; background: #111; border: 1px solid #292929; }
+  .mss-imgs a { display: block; }
 
   /* ── Analyze page ── */
   .az-grid { display: grid; gap: 1.5rem;
@@ -692,6 +778,22 @@ PAGE_HTML = r"""<!DOCTYPE html>
                    font-weight: 600; }
   .purge-confirm:hover  { background: #e55; }
   .purge-confirm:disabled { opacity: 0.5; cursor: default; }
+
+  /* ── Search overlay (opened from a Library term's 🔭 icon) ── */
+  #search-overlay { display: none; position: fixed; inset: 0;
+                     background: rgba(0,0,0,0.75); z-index: 500;
+                     align-items: flex-start; justify-content: center;
+                     padding: 3.5rem 1.5rem; overflow-y: auto; }
+  #search-overlay.open { display: flex; }
+  #search-dialog { background: #111; border: 2px solid #f90;
+                    border-radius: 8px; padding: 1.5rem 1.75rem;
+                    width: 100%; max-width: 960px; }
+  #search-dialog-head { display: flex; align-items: center;
+                          justify-content: space-between;
+                          margin-bottom: 1rem; }
+  #search-dialog-head h2 { margin: 0; color: #f90; font-size: 1.05rem; }
+  #search-close { cursor: pointer; color: #f90; font-size: 1.4rem;
+                   line-height: 1; }
 </style>
 </head>
 <body>
@@ -699,6 +801,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
 <div id="navbar">
   <h1>🧲 Magnet Library</h1>
   <a class="nav-link active" href="#" onclick="showPage('library',this)">Library</a>
+  <a class="nav-link" id="nav-search" href="#" onclick="showPage('search',this)">Search</a>
   <a class="nav-link"        href="#" onclick="showPage('analyze',this)">Analyze</a>
   <a class="nav-link"        href="#" onclick="showPage('history',this)">History</a>
   <div id="stats-bar">
@@ -707,6 +810,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
     <span id="stat-sites">— sites</span>
     <span id="stat-last">last: —</span>
   </div>
+  <button id="nav-toggle-btn" onclick="toggleTermBarLayout()">☰ Expand Terms</button>
   <button id="purge-btn" onclick="openPurge()">🗑 Purge DB</button>
 </div>
 
@@ -723,6 +827,18 @@ PAGE_HTML = r"""<!DOCTYPE html>
       <button class="purge-confirm" id="purge-confirm-btn"
               onclick="executePurge()">Delete Everything</button>
     </div>
+  </div>
+</div>
+
+<!-- ── Search overlay (reparents #page-search's content when opened from
+     a Library term's 🔭 icon, so Library's scroll/filters stay intact) ── -->
+<div id="search-overlay">
+  <div id="search-dialog">
+    <div id="search-dialog-head">
+      <h2>🔭 Search</h2>
+      <span id="search-close" onclick="closeSearchOverlay()">×</span>
+    </div>
+    <div id="search-overlay-mount"></div>
   </div>
 </div>
 
@@ -760,6 +876,23 @@ PAGE_HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<!-- ── Search page ──────────────────────────────────────────────────── -->
+<div id="page-search" class="page">
+  <div class="filter-row" id="mss-cat-bar"></div>
+  <div class="term-bar" id="mss-term-bar"></div>
+  <div class="toolbar">
+    <input id="mss-term" type="search" placeholder="Search term…"
+           onkeydown="if(event.key==='Enter') runMultiSearch()">
+    <button class="pg-btn" onclick="runMultiSearch()">🔍 Search all sites</button>
+    <label style="font-size:0.8rem;color:#888;display:flex;align-items:center;gap:0.3rem;white-space:nowrap">
+      <input type="checkbox" id="mss-preload-images" checked
+             style="width:auto"> Preload images
+    </label>
+  </div>
+  <div id="mss-wrap"><p class="empty">Pick a category above, enter a term, or click a 🔭 icon
+    on the Library page, to search every configured site at once.</p></div>
+</div>
+
 <!-- ── Analyze page ─────────────────────────────────────────────────── -->
 <div id="page-analyze" class="page">
   <div class="toolbar" style="margin-bottom:0.75rem">
@@ -790,25 +923,37 @@ let searchTimer    = null;
 let activeTerm     = '';   // currently selected search term ('' = all)
 let activeCategory = '';   // currently selected category   ('' = all)
 let searchUrl      = '';   // search_url template from config.ini ([search])
+let searchSites    = [];   // [{name, url}] from config.ini ([search_sites])
 
 // ── Config ───────────────────────────────────────────────────────────────
 async function loadConfig() {
   try {
     const c = await apiFetch('/api/config');
-    searchUrl = c.search_url || '';
+    searchUrl   = c.search_url   || '';
+    searchSites = c.search_sites || [];
   } catch(e) { console.warn('Config load failed', e); }
 }
 
-function buildSearchUrl(term) {
+function buildUrl(template, term) {
   const encoded = encodeURIComponent(term);
-  if (!searchUrl) return null;
-  return searchUrl.includes('{term}')
-    ? searchUrl.replace('{term}', encoded)
-    : searchUrl + encoded;
+  if (!template) return null;
+  return template.includes('{term}')
+    ? template.replace('{term}', encoded)
+    : template + encoded;
+}
+
+function buildSearchUrl(term) {
+  return buildUrl(searchUrl, term);
 }
 
 // ── Page switching ─────────────────────────────────────────────────────────
 function showPage(name, el) {
+  // If the search overlay currently holds #page-search's content, reclaim
+  // it first so the Search tab isn't left empty.
+  if (name === 'search' &&
+      document.getElementById('search-overlay').classList.contains('open')) {
+    closeSearchOverlay();
+  }
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-link').forEach(a => a.classList.remove('active'));
   document.getElementById('page-' + name).classList.add('active');
@@ -816,6 +961,7 @@ function showPage(name, el) {
   if (name === 'library') loadLibrary();
   if (name === 'analyze') loadAnalyze();
   if (name === 'history') loadHistory();
+  if (name === 'search')  renderMultiSearchSites();
   return false;
 }
 
@@ -858,16 +1004,33 @@ async function loadCategories() {
   try {
     const cats = await apiFetch('/api/categories');
     const bar  = document.getElementById('cat-bar');
-    // Clear all pills except the hardcoded "All"
-    Array.from(bar.querySelectorAll('.cat-pill:not(:first-of-type)'))
+    // Clear all category groups (dynamic pills) — leave the hardcoded "All" pill
+    Array.from(bar.querySelectorAll('.cat-group'))
          .forEach(p => p.remove());
     cats.forEach(c => {
+      const group = document.createElement('span');
+      group.className = 'cat-group';
+
       const pill = document.createElement('span');
       pill.className   = 'cat-pill';
       pill.textContent = c.category;
       pill.title       = `${c.term_count} term(s)`;
       pill.onclick     = () => setCategory(c.category);
-      bar.appendChild(pill);
+      group.appendChild(pill);
+
+      if (searchSites.length) {
+        const spyglass = document.createElement('span');
+        spyglass.className = 'term-search-icon';
+        spyglass.textContent = '🔭';
+        spyglass.title = `Search "${c.category}" across all sites`;
+        spyglass.onclick = (e) => {
+          e.stopPropagation();
+          openSearchOverlay(c.category);
+        };
+        group.appendChild(spyglass);
+      }
+
+      bar.appendChild(group);
     });
   } catch(e) { console.warn('Categories load failed', e); }
 }
@@ -925,6 +1088,18 @@ async function loadTerms(categoryFilter = '') {
         group.appendChild(glass);
       }
 
+      if (searchSites.length) {
+        const spyglass = document.createElement('span');
+        spyglass.className = 'term-search-icon';
+        spyglass.textContent = '🔭';
+        spyglass.title = `Search "${t.term}" across all sites`;
+        spyglass.onclick = (e) => {
+          e.stopPropagation();
+          openSearchOverlay(t.term);
+        };
+        group.appendChild(spyglass);
+      }
+
       bar.appendChild(group);
     });
   } catch(e) { console.warn('Terms load failed', e); }
@@ -939,6 +1114,138 @@ function setTerm(term) {
     p.classList.toggle('active', active);
   });
   loadLibrary();
+}
+
+// ── Multi-site search ────────────────────────────────────────────────────
+async function loadSearchCategories() {
+  const bar = document.getElementById('mss-cat-bar');
+  if (!bar || bar.childElementCount) return;   // populate once
+  try {
+    const cats = await apiFetch('/api/categories');
+    bar.innerHTML = '<span class="filter-label">Category:</span>';
+    cats.forEach(c => {
+      const pill = document.createElement('span');
+      pill.className   = 'cat-pill';
+      pill.textContent = c.category;
+      pill.title       = `${c.term_count} term(s)`;
+      pill.onclick     = () => {
+        document.querySelectorAll('#mss-cat-bar .cat-pill')
+                 .forEach(p => p.classList.toggle('active', p === pill));
+        loadSearchTerms(c.category);
+      };
+      bar.appendChild(pill);
+    });
+  } catch(e) { console.warn('Search categories load failed', e); }
+}
+
+async function loadSearchTerms(category) {
+  const bar = document.getElementById('mss-term-bar');
+  try {
+    const terms = await apiFetch(`/api/terms?category=${encodeURIComponent(category)}`);
+    bar.innerHTML = '<span class="term-label">Term:</span>';
+    terms.forEach(t => {
+      const group = document.createElement('span');
+      group.className = 'term-group';
+
+      const pill = document.createElement('span');
+      pill.className   = 'term-pill';
+      pill.textContent = t.term;
+      pill.title       = `Used ${t.use_count}× · last: ${t.last_used.slice(0,10)}`;
+      pill.onclick     = () => {
+        document.getElementById('mss-term').value = t.term;
+        runMultiSearch();
+      };
+      group.appendChild(pill);
+      bar.appendChild(group);
+    });
+  } catch(e) { console.warn('Search terms load failed', e); }
+}
+
+function renderMultiSearchSites() {
+  loadSearchCategories();
+  const term = document.getElementById('mss-term').value.trim();
+  if (!term) return;
+  runMultiSearch();
+}
+
+function runMultiSearch() {
+  const term = document.getElementById('mss-term').value.trim();
+  const wrap = document.getElementById('mss-wrap');
+
+  document.querySelectorAll('#mss-term-bar .term-pill').forEach(p => {
+    p.classList.toggle('active', p.textContent === term);
+  });
+
+  if (!term) {
+    wrap.innerHTML = '<p class="empty">Enter a search term above.</p>';
+    return;
+  }
+  if (!searchSites.length) {
+    wrap.innerHTML = '<p class="empty">No sites configured — add entries under ' +
+      '[search_sites] in config.ini.</p>';
+    return;
+  }
+
+  const preloadImages = document.getElementById('mss-preload-images').checked;
+
+  let siteHtml = `<div class="mss-grid">`;
+  searchSites.forEach(site => {
+    const url = buildUrl(site.url, term);
+    if (!url) return;
+    // Torrent sites commonly block framing (X-Frame-Options / frame-busting JS),
+    // which would otherwise navigate this whole tab away — link out instead.
+    siteHtml += `<div class="mss-card">
+      <h3><span>${escHtml(site.name)}</span></h3>
+      <a class="mss-open" href="${escHtml(url)}" target="_blank" rel="noopener"
+         style="display:block;text-align:center;padding:0.6rem;font-size:0.85rem">
+        Open "${escHtml(term)}" on ${escHtml(site.name)} ↗
+      </a>
+    </div>`;
+  });
+  siteHtml += `</div>`;
+
+  const imgSectionId = 'mss-img-section';
+  const imgBlock = preloadImages
+    ? `<div class="mss-card" style="margin-bottom:1.2rem" id="${imgSectionId}">
+         <h3><span>🖼 Image previews for "${escHtml(term)}"</span></h3>
+         <p class="loading" style="padding:1rem 0">Loading images…</p>
+       </div>`
+    : '';
+
+  wrap.innerHTML = imgBlock + siteHtml;
+
+  if (preloadImages) loadImagePreviews(term, imgSectionId);
+}
+
+async function loadImagePreviews(term, sectionId) {
+  const section = document.getElementById(sectionId);
+  if (!section) return;
+  try {
+    const d = await apiFetch(`/api/image_search?q=${encodeURIComponent(term)}&limit=12`);
+    const imgs = d.images || [];
+    if (!imgs.length) {
+      section.querySelector('p, .mss-imgs')?.remove();
+      section.insertAdjacentHTML('beforeend',
+        '<p class="empty" style="padding:0.5rem 0">No preview images found.</p>');
+      return;
+    }
+    const bingUrl = `https://www.bing.com/images/search?q=${encodeURIComponent(term)}`;
+    let html = `<div class="mss-imgs">`;
+    imgs.forEach(src => {
+      html += `<a href="${bingUrl}" target="_blank" rel="noopener">
+        <img src="${escHtml(src)}" loading="lazy" referrerpolicy="no-referrer"
+             alt="Preview for ${escHtml(term)}"
+             onerror="this.closest('a').remove()">
+      </a>`;
+    });
+    html += `</div>`;
+    section.querySelector('p')?.remove();
+    section.insertAdjacentHTML('beforeend', html);
+  } catch (e) {
+    section.querySelector('p')?.remove();
+    section.insertAdjacentHTML('beforeend',
+      `<p class="empty" style="padding:0.5rem 0">Image load failed: ${escHtml(e.message)}</p>`);
+  }
 }
 
 async function loadLibrary() {
@@ -1400,6 +1707,29 @@ function escHtml(str) {
     .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+// ── Search overlay ───────────────────────────────────────────────────────
+// Reparents #page-search's content into the overlay dialog so it can be
+// opened on top of Library (scroll position, filters, etc. stay intact)
+// without going through showPage's full-page swap.
+function openSearchOverlay(term) {
+  const pageSearch = document.getElementById('page-search');
+  const mount       = document.getElementById('search-overlay-mount');
+  if (pageSearch.parentElement !== mount) {
+    while (pageSearch.firstChild) mount.appendChild(pageSearch.firstChild);
+  }
+  document.getElementById('search-overlay').classList.add('open');
+  loadSearchCategories();
+  if (term !== undefined) document.getElementById('mss-term').value = term;
+  runMultiSearch();
+}
+
+function closeSearchOverlay() {
+  const pageSearch = document.getElementById('page-search');
+  const mount       = document.getElementById('search-overlay-mount');
+  while (mount.firstChild) pageSearch.appendChild(mount.firstChild);
+  document.getElementById('search-overlay').classList.remove('open');
+}
+
 // ── Purge ─────────────────────────────────────────────────────────────────
 function openPurge() {
   document.getElementById('purge-overlay').classList.add('open');
@@ -1451,8 +1781,34 @@ async function executePurge() {
 document.getElementById('purge-overlay').addEventListener('click', function(e) {
   if (e.target === this) closePurge();
 });
+document.getElementById('search-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeSearchOverlay();
+});
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape' &&
+      document.getElementById('search-overlay').classList.contains('open')) {
+    closeSearchOverlay();
+  }
+});
+
+// ── Term-bar layout toggle ──────────────────────────────────────────────────
+// Compact (capped height, scrollable) is the default — keeps the term-bar
+// usable when a run has produced hundreds of search terms. Users can switch
+// back to the original unbounded/wrapping layout; the choice is remembered.
+function applyTermBarLayout(compact) {
+  document.getElementById('term-bar').classList.toggle('compact', compact);
+  document.getElementById('nav-toggle-btn').textContent =
+    compact ? '☰ Expand Terms' : '☰ Collapse Terms';
+}
+
+function toggleTermBarLayout() {
+  const compact = !document.getElementById('term-bar').classList.contains('compact');
+  localStorage.setItem('termBarCompact', compact ? '1' : '0');
+  applyTermBarLayout(compact);
+}
 
 // ── Boot ───────────────────────────────────────────────────────────────────
+applyTermBarLayout(localStorage.getItem('termBarCompact') !== '0');
 loadConfig();
 loadStats();
 loadCategories();
@@ -1572,7 +1928,7 @@ class Handler(BaseHTTPRequestHandler):
 
             # ── API: client config (search_url, etc.) ──────────────────────
             elif path == '/api/config':
-                self._send_json({'search_url': SEARCH_URL})
+                self._send_json({'search_url': SEARCH_URL, 'search_sites': SEARCH_SITES})
 
             # ── API: categories ───────────────────────────────────────────
             elif path == '/api/categories':
@@ -1610,6 +1966,10 @@ class Handler(BaseHTTPRequestHandler):
                 sid = int(qs1('run', '0'))
                 self._send_json(api_analyze(conn, sid))
 
+            # ── API: image search (preview thumbnails for a term) ─────────
+            elif path == '/api/image_search':
+                self._send_json(api_image_search(qs1('q'), int(qs1('limit', '12'))))
+
             # ── API: search history ───────────────────────────────────────
             elif path == '/api/searches':
                 self._send_json(api_searches(conn))
@@ -1639,6 +1999,11 @@ class Handler(BaseHTTPRequestHandler):
 
 def parse_args():
     p = argparse.ArgumentParser(description='Magnet Library web interface')
+    p.add_argument('--host', default='127.0.0.1', metavar='ADDR',
+                   help='Address to bind (default: 127.0.0.1, local-only). '
+                        'Use 0.0.0.0 to accept connections from other '
+                        'devices on your LAN — there is no authentication, '
+                        'so only do this on a trusted home network.')
     p.add_argument('--port', type=int, default=DEFAULT_PORT,
                    help=f'Port to listen on (default: {DEFAULT_PORT})')
     p.add_argument('--db', default=DEFAULT_DB,
@@ -1652,6 +2017,21 @@ def parse_args():
     return p.parse_args()
 
 
+def lan_ip() -> str | None:
+    """Best-effort LAN IP via a UDP socket (no packets are actually sent) —
+    more reliable than gethostbyname(gethostname()), which can resolve to
+    127.0.0.1 depending on /etc/hosts and network config."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(('8.8.8.8', 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        return None
+
+
 def main():
     args = parse_args()
 
@@ -1662,11 +2042,21 @@ def main():
     Handler.db_path      = args.db
     Handler.tr_host      = args.transmission_host
     Handler.download_dir = args.download_dir
-    server = HTTPServer(('127.0.0.1', args.port), Handler)
+    server = HTTPServer((args.host, args.port), Handler)
 
     url = f'http://localhost:{args.port}'
     print(f'🧲 Magnet Library running at {url}')
     print(f'   Database: {args.db}')
+    if args.host != '127.0.0.1':
+        ip = lan_ip()
+        if ip:
+            print(f'   ⚠️  Bound to {args.host} — reachable from other devices '
+                  f'on your network at http://{ip}:{args.port}')
+        else:
+            print(f'   ⚠️  Bound to {args.host} — reachable from other devices '
+                  f'on your network (could not detect LAN IP)')
+        print('   ⚠️  There is no login/authentication — anyone on your '
+              'network can view and purge the database.')
     print('   Press Ctrl+C to stop.\n')
 
     if not args.no_browser:
