@@ -284,7 +284,7 @@ def build_search_urls(term: str, urls_file: str) -> list[str]:
     """Read URL templates from urls_file and inject the search term into each."""
     try:
         with open(urls_file, 'r') as f:
-            templates = [l.strip() for l in f if l.strip()]
+            templates = [l.strip() for l in f if l.strip() and not l.strip().startswith('#')]
     except FileNotFoundError:
         print(f'[ERROR] URLs file not found: {urls_file}')
         sys.exit(1)
