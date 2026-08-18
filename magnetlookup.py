@@ -212,6 +212,11 @@ def seed_int(r: dict) -> int:
         return 0
 
 def seeded(r: dict) -> bool:
+    # archive.org hosts files directly rather than via a P2P swarm, so it
+    # never reports a seed count (always '?') — treat those as available
+    # rather than filtering them out like an unparsed/dead seed count.
+    if 'archive.org' in urlparse(r.get('source_url', '')).netloc.lower():
+        return True
     s = str(r.get('seeds', '0')).strip()
     try:
         return int(s) > 0
@@ -318,11 +323,45 @@ def _parse_search_term_lines(lines: list[str]) -> list[tuple[str, str]]:
 
     return results
 
+def _read_lines_s3_or_local(path: str) -> list[str] | None:
+    """
+    Read a text file's lines from either an s3://bucket/key URI (via the
+    aws CLI, using the instance's IAM role — no stored credentials needed)
+    or the local filesystem. Returns None if the file/object doesn't exist,
+    printing a [WARN] rather than raising, since this is always the
+    optional 2nd search-term source.
+    """
+    if path.startswith('s3://'):
+        try:
+            result = subprocess.run(
+                ['aws', 's3', 'cp', path, '-'],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                print(f'[WARN] 2nd search term file not found on S3, skipping: '
+                      f'{path} ({result.stderr.strip()})')
+                return None
+            return result.stdout.splitlines(keepends=True)
+        except FileNotFoundError:
+            print('[WARN] aws CLI not found — install it to use an s3:// '
+                  f'2nd search term file, skipping: {path}')
+            return None
+        except subprocess.TimeoutExpired:
+            print(f'[WARN] S3 fetch timed out, skipping: {path}')
+            return None
+
+    try:
+        with open(path, 'r') as f:
+            return f.readlines()
+    except FileNotFoundError:
+        print(f'[WARN] 2nd search term file not found, skipping: {path}')
+        return None
+
 def read_search_terms(path: str, path_2: str = '') -> list[tuple[str, str]]:
     """
-    Read search_term.txt (and optionally a 2nd search-term file, e.g. from
-    Google Drive) and return a combined, de-duplicated list of
-    (term, category) tuples.
+    Read search_term.txt (and optionally a 2nd search-term file — a local
+    path, e.g. Google Drive, or an s3://bucket/key URI) and return a
+    combined, de-duplicated list of (term, category) tuples.
 
     File format:
         [Music]             ← sets current category (title-cased on read)
@@ -350,13 +389,10 @@ def read_search_terms(path: str, path_2: str = '') -> list[tuple[str, str]]:
     sources = [path]
 
     if path_2:
-        try:
-            with open(path_2, 'r') as f:
-                lines_2 = f.readlines()
+        lines_2 = _read_lines_s3_or_local(path_2)
+        if lines_2 is not None:
             results.extend(_parse_search_term_lines(lines_2))
             sources.append(path_2)
-        except FileNotFoundError:
-            print(f'[WARN] 2nd search term file not found, skipping: {path_2}')
 
     # De-dupe (term, category) pairs while preserving first-seen order —
     # the same term can legitimately appear under different categories.
@@ -689,7 +725,7 @@ def scrape_archive_org(url: str, max_results: int = 15) -> list[dict]:
                 'page': '1',
                 'output': 'json',
             },
-            headers=HEADERS, timeout=20,
+            headers=HEADERS, timeout=(10, 20),
         )
         resp.raise_for_status()
         docs = resp.json().get('response', {}).get('docs', [])
@@ -707,7 +743,7 @@ def scrape_archive_org(url: str, max_results: int = 15) -> list[dict]:
 
         try:
             meta = requests.get(f'https://archive.org/metadata/{identifier}',
-                                 headers=HEADERS, timeout=20).json()
+                                 headers=HEADERS, timeout=(10, 20)).json()
         except Exception as e:
             print(f'  [WARN] archive.org metadata failed for {identifier}: {e}')
             continue
@@ -719,7 +755,7 @@ def scrape_archive_org(url: str, max_results: int = 15) -> list[dict]:
 
         try:
             tbytes = requests.get(f'https://archive.org/download/{identifier}/{torrent_name}',
-                                   headers=HEADERS, timeout=30).content
+                                   headers=HEADERS, timeout=(10, 30)).content
             info_hash = torrent_info_hash(tbytes)
         except Exception as e:
             print(f'  [WARN] archive.org torrent parse failed for {identifier}: {e}')
@@ -1432,8 +1468,9 @@ def parse_args():
     p.add_argument(
         '--search-file-2', metavar='PATH',
         default=DEFAULT_SEARCH_FILE_2,
-        help='Path to a 2nd search_term.txt (e.g. Google Drive) whose terms '
-             'are concatenated with --search-file before searching. '
+        help='Path to a 2nd search_term.txt (e.g. Google Drive, or an '
+             's3://bucket/key URI) whose terms are concatenated with '
+             '--search-file before searching. '
              f'Default from config.ini: {DEFAULT_SEARCH_FILE_2 or "(none)"}'
     )
     p.add_argument(
