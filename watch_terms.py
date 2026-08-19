@@ -21,6 +21,7 @@ import argparse
 import subprocess
 import configparser
 import re
+import json
 from pathlib import Path
 
 # ── Read config (same logic as magnetlookup.py / webserver.py) ───────────────
@@ -73,15 +74,47 @@ MAGNETLOOKUP = Path(__file__).with_name('magnetlookup.py')
 
 # ── Watcher ───────────────────────────────────────────────────────────────────
 
+def _read_terms_s3(path: str) -> str:
+    try:
+        result = subprocess.run(
+            ['aws', 's3', 'cp', path, '-'],
+            capture_output=True, text=True, timeout=30,
+        )
+        return result.stdout if result.returncode == 0 else ''
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ''
+
+def _stat_key_s3(path: str):
+    """Return the object's ETag (changes whenever content changes), or None
+    if it can't be reached — via `aws s3api head-object`, no local mtime/size
+    available for a remote object."""
+    try:
+        result = subprocess.run(
+            ['aws', 's3api', 'head-object', '--bucket', path.split('/')[2],
+             '--key', '/'.join(path.split('/')[3:])],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0:
+            return None
+        return json.loads(result.stdout).get('ETag')
+    except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+
 def read_terms(path: str) -> str:
-    """Return raw file content, or empty string if unreadable."""
+    """Return raw file content, or empty string if unreadable. Supports
+    both local paths and s3://bucket/key URIs."""
+    if path.startswith('s3://'):
+        return _read_terms_s3(path)
     try:
         return Path(path).read_text(encoding='utf-8', errors='replace')
     except OSError:
         return ''
 
 def stat_key(path: str):
-    """Return (mtime, size) tuple, or None if file absent."""
+    """Return a cheap change-detection key (mtime+size locally, ETag for
+    s3://), or None if the file/object is absent/unreachable."""
+    if path.startswith('s3://'):
+        return _stat_key_s3(path)
     try:
         s = os.stat(path)
         return (s.st_mtime, s.st_size)

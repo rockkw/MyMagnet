@@ -1,0 +1,25 @@
+[Unit]
+Description=magnetlookup search-term watcher (triggers a scrape on change)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=magnetlookup
+Group=magnetlookup
+WorkingDirectory=/opt/magnetlookup/app
+EnvironmentFile=/etc/magnetlookup/env
+ExecStart=/opt/magnetlookup/venv/bin/python3 -u watch_terms.py --no-js
+Restart=on-failure
+RestartSec=10
+
+# Hardening — the process only needs to read/write its own data dir and
+# reach the network; lock everything else down. Matches magnetlookup.service.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/magnetlookup/data
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
